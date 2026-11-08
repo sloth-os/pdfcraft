@@ -4,10 +4,13 @@
 # This repository holds none of PdfCraft's source. The workflow checks out upstream PdfCraft (its
 # newest release by default), builds apps/pdfcraft-web the way the official web release is built —
 # the "web" job of storytold/craft-common-actions' release.yml: stable Rust with the
-# wasm32-unknown-unknown target, Trunk 0.21.14, and the craft-i18n checkout pinned by the app's
-# craft-i18n.rev — and deploys the static site Trunk leaves in dist/web. Every URL in the generated
-# index.html is relative (public_url = "./" in apps/pdfcraft-web/Trunk.toml), so the site works
-# under the /pdfcraft/ path this repository's Pages serves it from.
+# wasm32-unknown-unknown target, Trunk 0.21.14, the craft-i18n checkout pinned by the app's
+# craft-i18n.rev, and (the release recipe's web-craft-fonts option) the craft-fonts checkout
+# pinned by PdfCraft's own release.yml, so the wasm embeds the fallback fonts and Edit text works
+# for Japanese, Arabic, Thai, Hebrew and Devanagari text — and deploys the static site Trunk leaves
+# in dist/web. Every URL in the generated index.html is relative (public_url = "./" in
+# apps/pdfcraft-web/Trunk.toml), so the site works under the /pdfcraft/ path this repository's
+# Pages serves it from.
 
 name: Publish PdfCraft wasm to Pages
 
@@ -86,6 +89,23 @@ jobs:
           ref: ${{ steps.ref.outputs.ref }}
           persist-credentials: false
 
+      # The wasm build embeds the fallback fonts of the optional craft-fonts input (without them,
+      # Edit text refuses Japanese text — the error names CRAFT_FONTS_DIR). PdfCraft's own release
+      # recipe pins craft-fonts in its release.yml; read that pin so it tracks upstream, falling
+      # back to the pin of v0.19.0 (2026-11-07) if the file ever changes shape.
+      - name: Read the craft-fonts pin from PdfCraft's release recipe
+        id: fonts
+        run: |
+          set -euo pipefail
+          fonts_ref=$(awk '/craft-fonts-ref/ { if (match($0, /[0-9a-f]{40}/)) { print substr($0, RSTART, RLENGTH); exit } }' \
+            .github/workflows/release.yml || true)
+          if [[ -z "$fonts_ref" ]]; then
+            echo "::warning::could not read the craft-fonts pin from PdfCraft's release.yml; using the pin of v0.19.0"
+            fonts_ref="b076417b5880bd4154bd22f00695b1d28c6bea83"
+          fi
+          echo "craft-fonts pin: $fonts_ref"
+          echo "fonts-ref=$fonts_ref" >> "$GITHUB_OUTPUT"
+
       # Same toolchain as the official web release: stable, plus the wasm target.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -101,12 +121,25 @@ jobs:
         with:
           trunk-version: "0.21.14"
 
+      # The release recipe's web-craft-fonts option: check out the pinned craft-fonts, and the
+      # build embeds its fonts. The build.rs of crates/fonts embeds the wasm subset on wasm32 —
+      # the Japanese fallback face BIZ UDPGothic Regular and the small Arabic/Thai/Hebrew/
+      # Devanagari faces, about 6 MiB — and CRAFT_FONTS_REQUIRED=1 makes a bad checkout fatal
+      # instead of quietly shipping the degraded build again.
+      - name: Check out craft-fonts
+        uses: storytold/craft-common-actions/actions/checkout-craft-fonts@8e9b8b96c5d64c54eba462f5e8cac196787e744d # main, 2026-11-07
+        with:
+          ref: ${{ steps.fonts.outputs.fonts-ref }}
+
       # Checks out storytold/craft-i18n at the rev in craft-i18n.rev and sets CRAFT_I18N_DIR and
       # CRAFT_I18N_REQUIRED=1, so the interface ships with its translations.
       - uses: storytold/craft-common-actions/actions/checkout-craft-i18n@8e9b8b96c5d64c54eba462f5e8cac196787e744d # main, 2026-11-07
 
       - name: Build the wasm site
         working-directory: apps/pdfcraft-web
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
         run: trunk build --release
 
       - name: The site must use relative URLs
@@ -119,21 +152,31 @@ jobs:
           fi
           echo "dist/web/index.html uses relative URLs; the site works under any path prefix."
 
-      # PdfCraft is MIT OR Apache-2.0; redistribution carries its notices. The release zip does
-      # this through copy_docs in packaging/env.sh.
+      # PdfCraft is MIT OR Apache-2.0; redistribution carries its notices. The embedded craft-fonts
+      # faces are OFL-1.1, whose licence must ship with them. The release zip does both through
+      # copy_docs/copy_font_licences in packaging/env.sh.
       - name: Ship PdfCraft's licence files and build info with the site
         env:
           # Caller-influenced (workflow_dispatch), so through env, never interpolated.
           PDFCRAFT_REF: ${{ steps.ref.outputs.ref }}
           PDFCRAFT_COMMIT: ${{ steps.checkout.outputs.commit }}
+          FONTS_REF: ${{ steps.fonts.outputs.fonts-ref }}
         run: |
           set -euo pipefail
           for f in LICENSE-MIT LICENSE-APACHE NOTICE; do
             if [[ -f "$f" ]]; then cp "$f" dist/web/; echo "dist/web/$f"; fi
           done
+          # fonts/<family>/OFL.txt -> OFL-<family>.txt, as copy_font_licences packs them.
+          for f in craft-fonts/fonts/*/OFL.txt; do
+            if [[ -f "$f" ]]; then
+              family="$(basename "$(dirname "$f")")"
+              cp "$f" "dist/web/OFL-$family.txt"
+              echo "dist/web/OFL-$family.txt"
+            fi
+          done
           # Provenance: which upstream build the published site is.
-          printf 'Built from github.com/storytold/pdfcraft\nref:    %s\ncommit: %s\n' \
-            "$PDFCRAFT_REF" "$PDFCRAFT_COMMIT" > dist/web/BUILD.txt
+          printf 'Built from github.com/storytold/pdfcraft\nref:    %s\ncommit: %s\nfonts:  craft-fonts %s\n' \
+            "$PDFCRAFT_REF" "$PDFCRAFT_COMMIT" "$FONTS_REF" > dist/web/BUILD.txt
           cat dist/web/BUILD.txt
 
       - name: Configure Pages
@@ -153,6 +196,7 @@ jobs:
         env:
           REF: ${{ steps.ref.outputs.ref }}
           COMMIT: ${{ steps.checkout.outputs.commit }}
+          FONTS_REF: ${{ steps.fonts.outputs.fonts-ref }}
           PAGE_URL: ${{ steps.deploy.outputs.page_url }}
         run: |
           set -euo pipefail
@@ -167,6 +211,7 @@ jobs:
             echo "|---|---|"
             echo "| PdfCraft ref | \`$ref_display\` |"
             echo "| Upstream commit | \`$COMMIT\` |"
+            echo "| craft-fonts | \`$FONTS_REF\` |"
             echo "| Version | $version |"
             echo "| Site | $PAGE_URL |"
           } >> "$GITHUB_STEP_SUMMARY"

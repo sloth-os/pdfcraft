@@ -10,8 +10,11 @@ This repository holds no PdfCraft source. It contains one workflow,
 
 1. checks out upstream PdfCraft — the newest release by default, or the ref given to a manual run;
 2. builds `apps/pdfcraft-web` the way the official web release is built: stable Rust with the
-   `wasm32-unknown-unknown` target, Trunk 0.21.14 (sha256-verified), and the craft-i18n checkout
-   pinned by the app's `craft-i18n.rev`;
+   `wasm32-unknown-unknown` target, Trunk 0.21.14 (sha256-verified), the craft-i18n checkout
+   pinned by the app's `craft-i18n.rev`, and — the official recipe's optional `web-craft-fonts`
+   input, which this site enables — the craft-fonts checkout pinned by PdfCraft's own
+   `release.yml`, so the wasm embeds the fallback fonts (the Japanese face BIZ UDPGothic Regular
+   and the small Arabic/Thai/Hebrew/Devanagari faces) and Edit text works for those scripts;
 3. deploys the static site Trunk leaves in `dist/web` to GitHub Pages.
 
 It runs on every push to `main`, once a day (03:17 UTC), and manually from the Actions tab
@@ -22,7 +25,7 @@ run always works, and the schedule can be re-enabled from the Actions tab.
 All URLs in the generated `index.html` are relative, so the site works under the `/pdfcraft/`
 path GitHub Pages serves it from — and inside an `<iframe>`. Hosting notes and URL flags
 (`?file=`, `?webgl`, `?cpu`) are in [PdfCraft's packaging/web/README.md][hosting]. PdfCraft is
-MIT OR Apache-2.0; the site ships its licence files, and `BUILD.txt` names the upstream commit
-it was built from.
+MIT OR Apache-2.0 and the embedded craft-fonts faces are OFL-1.1; the site ships both sets of
+licence files, and `BUILD.txt` names the upstream commit and craft-fonts pin it was built from.
 
 [hosting]: https://github.com/storytold/pdfcraft/blob/main/packaging/web/README.md
