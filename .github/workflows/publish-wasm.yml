@@ -7,10 +7,13 @@
 # wasm32-unknown-unknown target, Trunk 0.21.14, the craft-i18n checkout pinned by the app's
 # craft-i18n.rev, and (the release recipe's web-craft-fonts option) the craft-fonts checkout
 # pinned by PdfCraft's own release.yml, so the wasm embeds the fallback fonts and Edit text works
-# for Japanese, Arabic, Thai, Hebrew and Devanagari text — and deploys the static site Trunk leaves
-# in dist/web. Every URL in the generated index.html is relative (public_url = "./" in
-# apps/pdfcraft-web/Trunk.toml), so the site works under the /pdfcraft/ path this repository's
-# Pages serves it from.
+# for Japanese, Arabic, Thai, Hebrew and Devanagari text. On top of the static site Trunk leaves
+# in dist/web, the workflow applies this repository's PWA layer (pwa/) — the web app manifest,
+# upstream's own app icon in the sizes installers ask for, and a service worker that caches the
+# build for offline use; see pwa/README.md — before deploying. Every URL in the generated
+# index.html is relative (public_url = "./" in apps/pdfcraft-web/Trunk.toml), and the PWA layer
+# keeps to relative URLs too, so the site works under the /pdfcraft/ path this repository's Pages
+# serves it from.
 
 name: Publish PdfCraft wasm to Pages
 
@@ -89,6 +92,16 @@ jobs:
           ref: ${{ steps.ref.outputs.ref }}
           persist-credentials: false
 
+      # Upstream is checked out at the workspace root, so this repository's own files are not in
+      # the workspace yet. The PWA layer applied after the build — the manifest, the icons, the
+      # service worker and the scripts that add and test them — lives in pwa/ here; bring it in
+      # at publisher/.
+      - name: Check out this repository's publishing layer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: publisher
+          persist-credentials: false
+
       # The wasm build embeds the fallback fonts of the optional craft-fonts input (without them,
       # Edit text refuses Japanese text — the error names CRAFT_FONTS_DIR). PdfCraft's own release
       # recipe pins craft-fonts in its release.yml; read that pin so it tracks upstream, falling
@@ -142,16 +155,6 @@ jobs:
           CRAFT_FONTS_REQUIRED: "1"
         run: trunk build --release
 
-      - name: The site must use relative URLs
-        run: |
-          # The same guard as packaging/web/package.sh: Pages serves the site under /pdfcraft/,
-          # so a root-absolute URL would point outside it and 404.
-          if grep -Eq '(src|href)="/[^/]' dist/web/index.html; then
-            echo "::error::dist/web/index.html has root-absolute URLs; they would break under the /pdfcraft/ path"
-            exit 1
-          fi
-          echo "dist/web/index.html uses relative URLs; the site works under any path prefix."
-
       # PdfCraft is MIT OR Apache-2.0; redistribution carries its notices. The embedded craft-fonts
       # faces are OFL-1.1, whose licence must ship with them. The release zip does both through
       # copy_docs/copy_font_licences in packaging/env.sh.
@@ -166,6 +169,12 @@ jobs:
           for f in LICENSE-MIT LICENSE-APACHE NOTICE; do
             if [[ -f "$f" ]]; then cp "$f" dist/web/; echo "dist/web/$f"; fi
           done
+          # The PWA layer ships upstream's own app icon; its licence names it and travels with
+          # it, like PdfCraft's other licence files.
+          if [[ -f assets/app-icon/LICENSE.txt ]]; then
+            cp assets/app-icon/LICENSE.txt dist/web/LICENSE-app-icon.txt
+            echo "dist/web/LICENSE-app-icon.txt"
+          fi
           # fonts/<family>/OFL.txt -> OFL-<family>.txt, as copy_font_licences packs them.
           for f in craft-fonts/fonts/*/OFL.txt; do
             if [[ -f "$f" ]]; then
@@ -178,6 +187,30 @@ jobs:
           printf 'Built from github.com/storytold/pdfcraft\nref:    %s\ncommit: %s\nfonts:  craft-fonts %s\n' \
             "$PDFCRAFT_REF" "$PDFCRAFT_COMMIT" "$FONTS_REF" > dist/web/BUILD.txt
           cat dist/web/BUILD.txt
+
+      # This repository's PWA layer, on top of upstream's build: the web app manifest, the icons
+      # (upstream's own app icon; its licence ships above), the theme colour and the registration
+      # of the offline-caching service worker. apply.py copies the layer into dist/web and
+      # injects the links into index.html; pwa/README.md explains the design.
+      - name: Add the PWA layer
+        run: python3 publisher/pwa/apply.py dist/web
+
+      # The layer's harness: static checks on the applied site, then sw.js driven through a mock
+      # service-worker environment — warm-up caching, the all-or-nothing build swap, offline
+      # navigation, and the files that must bypass the worker.
+      - name: Test the PWA layer
+        run: node publisher/pwa/test-pwa.mjs dist/web
+
+      - name: The site must use relative URLs
+        run: |
+          # The same guard as packaging/web/package.sh, on the finished page — upstream's build
+          # plus the PWA layer's own links: Pages serves the site under /pdfcraft/, so a
+          # root-absolute URL would point outside it and 404.
+          if grep -Eq '(src|href)="/[^/]' dist/web/index.html; then
+            echo "::error::dist/web/index.html has root-absolute URLs; they would break under the /pdfcraft/ path"
+            exit 1
+          fi
+          echo "dist/web/index.html uses relative URLs; the site works under any path prefix."
 
       - name: Configure Pages
         id: pages
