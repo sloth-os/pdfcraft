@@ -1,0 +1,164 @@
+# Publish the wasm build of PdfCraft (github.com/storytold/pdfcraft) to this repository's GitHub
+# Pages site: https://sloth-os.github.io/pdfcraft/
+#
+# This repository holds none of PdfCraft's source. The workflow checks out upstream PdfCraft (its
+# newest release by default), builds apps/pdfcraft-web the way the official web release is built —
+# the "web" job of storytold/craft-common-actions' release.yml: stable Rust with the
+# wasm32-unknown-unknown target, Trunk 0.21.14, and the craft-i18n checkout pinned by the app's
+# craft-i18n.rev — and deploys the static site Trunk leaves in dist/web. Every URL in the generated
+# index.html is relative (public_url = "./" in apps/pdfcraft-web/Trunk.toml), so the site works
+# under the /pdfcraft/ path this repository's Pages serves it from.
+
+name: Publish PdfCraft wasm to Pages
+
+on:
+  # The publishing configuration lives in this repository, so a push to main republishes the site.
+  push:
+    branches: [main]
+  # PdfCraft releases often; rebuild the newest release once a day. GitHub disables schedules
+  # after 60 days without repository activity — a manual run still works, and the schedule can be
+  # re-enabled from the repository's Actions tab.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      pdfcraft-ref:
+        description: "storytold/pdfcraft ref to build (branch, tag or SHA). Empty: the newest release, falling back to main."
+        type: string
+        required: false
+        default: ""
+
+# The token deploys to Pages; nothing here writes to the repository.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a queued run waits instead of cancelling the one in progress.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build the wasm site and deploy it
+    # A fork does not have this organization's Pages site, so it must not try to deploy to one.
+    if: github.repository == 'sloth-os/pdfcraft'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Resolve which PdfCraft ref to build
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Through env, never interpolated into the script: the input is caller-controlled.
+          PDFCRAFT_REF: ${{ inputs.pdfcraft-ref }}
+        run: |
+          set -euo pipefail
+          ref=""
+          if [[ -n "$PDFCRAFT_REF" ]]; then
+            ref="$PDFCRAFT_REF"
+            echo "building storytold/pdfcraft at the requested ref: $ref"
+          else
+            # Pushes and the schedule build the newest upstream release, so the site shows a
+            # released version, not a snapshot of main. Fall back to main when no release can be
+            # read (rate limit, network trouble).
+            ref=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  https://api.github.com/repos/storytold/pdfcraft/releases/latest \
+                  | jq -r '.tag_name // empty' || true)
+            if [[ -z "$ref" ]]; then
+              echo "::warning::could not resolve the newest storytold/pdfcraft release; building main"
+              ref="main"
+            fi
+            echo "building the newest storytold/pdfcraft release: $ref"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out PdfCraft
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/pdfcraft
+          ref: ${{ steps.ref.outputs.ref }}
+          persist-credentials: false
+
+      # Same toolchain as the official web release: stable, plus the wasm target.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: pages-wasm
+
+      # Downloads Trunk 0.21.14 and verifies it against the SHA-256 pinned in the action.
+      - uses: storytold/craft-common-actions/actions/install-trunk@8e9b8b96c5d64c54eba462f5e8cac196787e744d # main, 2026-11-07
+        with:
+          trunk-version: "0.21.14"
+
+      # Checks out storytold/craft-i18n at the rev in craft-i18n.rev and sets CRAFT_I18N_DIR and
+      # CRAFT_I18N_REQUIRED=1, so the interface ships with its translations.
+      - uses: storytold/craft-common-actions/actions/checkout-craft-i18n@8e9b8b96c5d64c54eba462f5e8cac196787e744d # main, 2026-11-07
+
+      - name: Build the wasm site
+        working-directory: apps/pdfcraft-web
+        run: trunk build --release
+
+      - name: The site must use relative URLs
+        run: |
+          # The same guard as packaging/web/package.sh: Pages serves the site under /pdfcraft/,
+          # so a root-absolute URL would point outside it and 404.
+          if grep -Eq '(src|href)="/[^/]' dist/web/index.html; then
+            echo "::error::dist/web/index.html has root-absolute URLs; they would break under the /pdfcraft/ path"
+            exit 1
+          fi
+          echo "dist/web/index.html uses relative URLs; the site works under any path prefix."
+
+      # PdfCraft is MIT OR Apache-2.0; redistribution carries its notices. The release zip does
+      # this through copy_docs in packaging/env.sh.
+      - name: Ship PdfCraft's licence files with the site
+        run: |
+          set -euo pipefail
+          for f in LICENSE-MIT LICENSE-APACHE NOTICE; do
+            if [[ -f "$f" ]]; then cp "$f" dist/web/; echo "dist/web/$f"; fi
+          done
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist/web
+
+      - name: Deploy to Pages
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Job summary
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+          COMMIT: ${{ steps.checkout.outputs.commit }}
+          PAGE_URL: ${{ steps.deploy.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          # The ref can be caller-supplied (workflow_dispatch); keep markdown-hostile characters
+          # out of the summary table.
+          ref_display=$(printf '%s' "$REF" | tr -d '`' | tr '|' '/')
+          version=$(awk '/^\[/ { in_pkg = ($0 == "[workspace.package]"); next } in_pkg && $1 == "version" { gsub(/[" ]/, "", $3); print $3; exit }' Cargo.toml)
+          {
+            echo "### PdfCraft wasm published"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| PdfCraft ref | \`$ref_display\` |"
+            echo "| Upstream commit | \`$COMMIT\` |"
+            echo "| Version | $version |"
+            echo "| Site | $PAGE_URL |"
+          } >> "$GITHUB_STEP_SUMMARY"
