@@ -121,12 +121,20 @@ jobs:
 
       # PdfCraft is MIT OR Apache-2.0; redistribution carries its notices. The release zip does
       # this through copy_docs in packaging/env.sh.
-      - name: Ship PdfCraft's licence files with the site
+      - name: Ship PdfCraft's licence files and build info with the site
+        env:
+          # Caller-influenced (workflow_dispatch), so through env, never interpolated.
+          PDFCRAFT_REF: ${{ steps.ref.outputs.ref }}
+          PDFCRAFT_COMMIT: ${{ steps.checkout.outputs.commit }}
         run: |
           set -euo pipefail
           for f in LICENSE-MIT LICENSE-APACHE NOTICE; do
             if [[ -f "$f" ]]; then cp "$f" dist/web/; echo "dist/web/$f"; fi
           done
+          # Provenance: which upstream build the published site is.
+          printf 'Built from github.com/storytold/pdfcraft\nref:    %s\ncommit: %s\n' \
+            "$PDFCRAFT_REF" "$PDFCRAFT_COMMIT" > dist/web/BUILD.txt
+          cat dist/web/BUILD.txt
 
       - name: Configure Pages
         id: pages
