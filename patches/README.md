@@ -12,8 +12,8 @@ recipe, the PWA layer — leaves upstream's source alone.
 
 Edit text in PdfCraft replaces a line of text with a generated Type 3 font when the source font
 can't draw the replacement. The faces it can draw from are embedded at build time from the
-optional craft-fonts input: the Japanese faces, the bundled Latin face, and small Hebrew/Arabic/
-Thai/Telugu/Devanagari faces. Simplified Chinese has a face in craft-fonts — LXGW WenKai Lite,
+optional craft-fonts input: the Japanese faces, the bundled Latin face, and the small Arabic/
+Thai/Hebrew/Devanagari faces. Simplified Chinese has a face in craft-fonts — LXGW WenKai Lite,
 in a manifest of its own, `fonts/simplified-chinese-manifest.txt` — but upstream reads that
 manifest in **native builds only**. A wasm build embeds none of it, so on this site Edit text
 refuses Simplified-only characters (潇, 测) with the no-fallback-font error, while the desktop
@@ -47,7 +47,7 @@ The patch makes the choice an opt-in rather than a fork of the rule:
   `/PCZh` font is recognized as one of ours when read back; the wasm build embeds the Chinese
   manifest only behind the opt-in; and a required build cannot pass without a real `Hans` face.
 
-Seven files, +160/−48 as of v0.19.0: `crates/fonts/{build.rs, src/cjk_scripts.rs, src/craft.rs,
+Seven files, +159/−46 as of v0.20.0: `crates/fonts/{build.rs, src/cjk_scripts.rs, src/craft.rs,
 src/lib.rs}` for the embed side, `crates/edit/src/text/fallback.rs` and its callers for the
 chain, `crates/edit/src/tests.rs` and `crates/edit/src/text.rs` for the tests.
 
@@ -70,12 +70,14 @@ BIZ UDPGothic face already suffers the same in its last 64 bytes). In the module
 linear memory every segment lands in one image, so the script parses the data section,
 reassembles that image, finds the face there and hashes it against the sha256 pinned in the
 manifest — a pin the build itself never checks. Negative controls: the same pipeline without
-the patch, and the live official site's artifact, both fail the guard; error paths (no wasm,
-missing manifest, a checkout that doesn't match its pin) fail loudly too.
+the patch, and the official release zip, both fail the guard — the zip embeds no craft-fonts
+faces at all, upstream's release recipe building the web artifact without the craft-fonts
+input — and the error paths (no wasm, missing manifest, a checkout that doesn't match its pin)
+fail loudly too.
 
 ## When it stops applying
 
-The patch was generated against v0.19.0 (upstream commit `8c572792`). When a release moves any
+The patch was generated against v0.20.0 (upstream commit `2ad7717f`). When a release moves any
 of the patched lines, `git apply --check` in the workflow fails the build loudly:
 
 > the Simplified Chinese web-fallback patch no longer applies to storytold/pdfcraft at \<ref\>;
@@ -96,28 +98,33 @@ Simplified Chinese support vanished. To regenerate:
    maintained.
 4. Verify as below, then push; the workflow rebuilds and deploys.
 
-## Verification record (v0.19.0, 2026-11-09)
+## Verification record (v0.20.0, 2026-11-09)
 
-- Applies cleanly to a pristine v0.19.0 checkout (`git apply --check`); the result is
+- Applies cleanly to a pristine v0.20.0 checkout (`git apply --check`); the result is
   byte-identical to the tree the tests below ran in.
 - `crates/fonts` and `crates/edit` tests pass with the face embedded (native and
-  `CRAFT_FONTS_WEB_HANS=1` wasm payloads) and skip visibly without it; the wasm face set is
-  the official five faces without the opt-in and six with it.
+  `CRAFT_FONTS_WEB_HANS=1` wasm payloads; 726 tests, none skipped) and skip with a visible
+  message without it; the wasm face set is the five regular faces without the opt-in and six
+  with it.
 - The full `pdfcraft-web` wasm build (stable Rust, `CRAFT_FONTS_DIR` + `CRAFT_FONTS_REQUIRED=1`
   + `CRAFT_FONTS_WEB_HANS=1` + the pinned craft-i18n; Trunk 0.21.14 → wasm-bindgen 0.2.129 →
-  wasm-opt version_123) compiles and links, and its final artifact embeds the LXGW WenKai Lite
-  face byte-exactly: reassembling the module's linear memory — the file never holds the face
-  as one byte string, wasm-opt having split it into 128 data segments — and hashing the
-  13,949,472 bytes at memory offset 10,991,524 yields exactly the manifest pin `f799a538…`, on
-  wasm-opt version_123 (Trunk's pin) and v132 alike. The same pipeline without the patch, and
-  the live official artifact, both fail that check; `verify-embedded-face.py` now runs it in
-  CI after every build.
+  wasm-opt version_123, Trunk's pin) compiles and links, and its final artifact embeds the
+  LXGW WenKai Lite face byte-exactly: reassembling the module's linear memory — the file never
+  holds the face as one byte string, wasm-opt having split it into 128 data segments — and
+  hashing the 13,949,472 bytes at memory offset 12,807,708 yields exactly the manifest pin
+  `f799a538…`. The same pipeline without the patch, and the official v0.20.0 release zip,
+  both fail that check; `verify-embedded-face.py` runs it in CI after every build.
 
-The size cost, measured on the same toolchain with and without the patch, is recorded in the
-table below (also the number the PWA layer's "~73 MB" cache-depth notes are rounded from):
+The size cost, measured on that toolchain with and without the patch:
 
 | build | wasm artifact |
 |---|---|
-| official web build (v0.19.0, unpatched) | 59.1 MB |
-| this site's build (same + the patch) | 72.4 MB |
-| of which the LXGW WenKai Lite face | 13.3 MB |
+| the official web build (v0.20.0's release zip) | 59.1 MB |
+| this site's build without the patch (the craft-fonts input enabled) | 65.2 MB |
+| this site's build (the same + the patch) | 79.1 MB |
+| of which the LXGW WenKai Lite face | 13.9 MB |
+
+The official zip's 59.1 MB embeds no fallback faces at all, so the whole 20 MB difference
+between it and this site's build is the embedded faces — 6 MB of them the craft-fonts input
+adds, 13.9 MB of them the patch does. (The PWA layer's "~79 MB" and "~83 MB" notes round from
+this table, the latter plus the OCR worker's 3.4 MB wasm that v0.20.0's Scan & OCR adds.)

@@ -2,19 +2,22 @@
 // Checks this repository's PWA layer against a built site; run it after pwa/apply.py.
 //   node pwa/test-pwa.mjs [DIST]      (default: dist/web; needs python3 for the re-apply)
 //
-// The static half verifies what apply.py put into DIST: the manifest (valid JSON, its
-// icons on disk and of the declared size) and the links, theme colour and service-worker
-// registration injected into index.html. The behavioural half runs sw.js in a mock
+// The static half verifies what the build and apply.py put into DIST: the manifest (valid
+// JSON, its icons on disk and of the declared size), the links, theme colour and
+// service-worker registration injected into index.html, the OCR worker's file chain (a
+// <meta> in index.html names its loader; the chain must resolve to the worker's wasm) and
+// the OCR models staged under models/. The behavioural half runs sw.js in a mock
 // service-worker environment — node's own URL and Response, a fake Cache Storage, and a
 // fetch that serves DIST from disk or rejects to simulate being offline — and drives it
 // through activation, the warm-up message and fetch events: the warm-up caches the
-// current build and prunes the previous one, an incomplete new build changes nothing,
+// current build (the OCR worker's chain included) and prunes the previous one, an
+// incomplete new build changes nothing, the warm-up leaves the OCR models uncached,
 // navigations answer from the cache offline, build assets are served without touching
-// the network, named files are fetched network-first, and anything that is not this
-// site's own GET is left to the browser.
+// the network, named files (an OCR model among them) are fetched network-first, and
+// anything that is not this site's own GET is left to the browser.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 
@@ -80,6 +83,49 @@ const hashed = [...index.matchAll(/(?:href|src)="([^"]+)"/g)]
 check(hashed.length >= 3, `index.html references the build's hashed assets (${hashed.length} seen)`);
 for (const url of hashed) {
   check(existsSync(path.join(dist, url)), `the build's ${url} is on disk`);
+}
+
+// v0.20.0's OCR worker is named in a chain, not in the page's links: a <meta> names the
+// worker's loader, whose script quotes the glue, whose script quotes the wasm (upstream's
+// build hook writes those names into the files it hashes). sw.js walks the same chain at
+// warm-up; this is the reference walk.
+const distPath = (link) =>
+  decodeURIComponent(new URL(link).pathname.slice(new URL(SCOPE).pathname.length));
+const chain = (() => {
+  const meta = index.match(/<meta(?=[^>]*name="pdfcraft-ocr-worker")[^>]*content="([^"]+)"/);
+  if (!meta) return null;
+  const links = [];
+  let link = new URL(meta[1], SHELL).href;
+  while (link && !link.endsWith(".wasm")) {
+    links.push(link);
+    const file = path.join(dist, distPath(link));
+    if (!existsSync(file)) return null;
+    const quoted = readFileSync(file, "utf8").match(/'([^']+\.(?:js|wasm))'/);
+    if (!quoted) return null;
+    link = new URL(quoted[1], SHELL).href;
+  }
+  links.push(link);
+  return links;
+})();
+check(chain !== null, "index.html names the OCR worker in a chain that resolves to its wasm");
+if (chain) {
+  check(chain.length === 3, `the OCR worker's chain is loader → glue → wasm (${chain.length} links)`);
+  for (const link of chain) {
+    check(existsSync(path.join(dist, distPath(link))), `the OCR worker's ${distPath(link)} is on disk`);
+  }
+}
+
+// The OCR models the page downloads on first use of Scan & OCR, staged under models/ by
+// the workflow the way upstream's own web packaging stages them. Checked by shape, not by
+// name: upstream's ATTRIBUTION.toml names the models, and they change with its releases.
+const models = existsSync(path.join(dist, "models"))
+  ? readdirSync(path.join(dist, "models"))
+  : [];
+const onnx = models.filter((name) => name.endsWith(".onnx"));
+check(onnx.length >= 1, `models/ stages the OCR models (${onnx.length} onnx seen)`);
+check(models.includes("ATTRIBUTION.txt"), "models/ATTRIBUTION.txt ships with the models");
+for (const name of onnx) {
+  check(models.includes(`${name}.LICENCE.txt`), `models/${name}.LICENCE.txt ships with it`);
 }
 
 // apply.py is idempotent: a second run must rewrite exactly the same page.
@@ -173,18 +219,23 @@ function makeWorker({ offline = false } = {}) {
 {
   const worker = makeWorker();
   const cache = await worker.caches.open(CACHE);
-  // What a previous build's warm-up left behind: its hashed files, gone from the server
-  // with the build that named them, and a small unhashed file that must survive.
+  // What a previous build's warm-up left behind: its hashed files — the app's and the OCR
+  // worker's — gone from the server with the build that named them, and a small unhashed
+  // file that must survive.
   await cache.put(new URL("pdfcraft-web-0123456789abcdef.js", SCOPE).href, new Response("old js", { status: 200 }));
   await cache.put(new URL("pdfcraft-web-0123456789abcdef_bg.wasm", SCOPE).href, new Response("old wasm", { status: 200 }));
+  await cache.put(new URL("pdfcraft-ocr-worker-0123456789abcdef.js", SCOPE).href, new Response("old worker glue", { status: 200 }));
+  await cache.put(new URL("pdfcraft-ocr-worker-0123456789abcdef_bg.wasm", SCOPE).href, new Response("old worker wasm", { status: 200 }));
   await cache.put(new URL("notes.txt", SCOPE).href, new Response("notes", { status: 200 }));
   await worker.dispatch("message", { data: "warm-up" }).promise;
 
   const keys = (await cache.keys()).map((request) => request.url);
-  // Everything the page loads: link targets plus the names quoted in the bootstrap script.
+  // Everything the page loads: link targets, the names quoted in the bootstrap script, and
+  // the OCR worker's chain out of its <meta>.
   const referenced = new Set([SHELL]);
   for (const match of index.matchAll(/(?:href|src)="([^"]+)"/g)) referenced.add(new URL(match[1], SHELL).href);
   for (const match of index.matchAll(/'([^']+\.(?:js|wasm))'/g)) referenced.add(new URL(match[1], SHELL).href);
+  if (chain) for (const link of chain) referenced.add(link);
   for (const target of referenced) {
     check(keys.includes(target), `the warm-up cached ${new URL(target).pathname}`);
   }
@@ -197,6 +248,10 @@ function makeWorker({ offline = false } = {}) {
     "the warm-up pruned the previous build's hashed files",
   );
   check(keys.includes(new URL("notes.txt", SCOPE).href), "an unhashed file is never pruned");
+  check(
+    !worker.fetchLog.some((target) => new URL(target).pathname.includes("/models/")),
+    "the warm-up leaves the OCR models uncached (the page fetches them on first use)",
+  );
 }
 
 // A new build whose files cannot all be fetched changes nothing; once complete, it
@@ -294,6 +349,30 @@ function makeWorker({ offline = false } = {}) {
   check(
     (await stale.clone().text()).includes('"changed"'),
     "offline, the last fetched copy of a named file answers",
+  );
+}
+
+// An OCR model is a named file too — network-first, offline fallback — so the model the
+// page fetches on first use of Scan & OCR keeps answering once the network is gone.
+if (onnx.length > 0) {
+  const worker = makeWorker();
+  await worker.dispatch("message", { data: "warm-up" }).promise;
+  const modelUrl = new URL(`models/${onnx[0]}`, SCOPE).href;
+  worker.net.handler = (requested) =>
+    requested === modelUrl
+      ? new Response("model, changed", { status: 200 })
+      : distServer(requested);
+  const fresh = await worker.dispatch("fetch", {
+    request: { url: modelUrl, method: "GET", mode: "same-origin" },
+  }).response;
+  check((await fresh.clone().text()).includes("changed"), "an OCR model is served network-first (fresh when online)");
+  worker.net.offline = true;
+  const stale = await worker.dispatch("fetch", {
+    request: { url: modelUrl, method: "GET", mode: "same-origin" },
+  }).response;
+  check(
+    (await stale.clone().text()).includes("changed"),
+    "offline, the last fetched copy of a model answers",
   );
 }
 

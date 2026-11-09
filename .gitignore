@@ -1,0 +1,2 @@
+# verify-embedded-face.py is exec'd by tooling (importlib), which caches its bytecode here.
+__pycache__/

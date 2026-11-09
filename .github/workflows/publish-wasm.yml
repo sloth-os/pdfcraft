@@ -11,7 +11,9 @@
 # repository's Simplified Chinese web-fallback patch (patches/) — upstream reads craft-fonts'
 # separate Chinese manifest in native builds only, and the patch adds the opt-in
 # (CRAFT_FONTS_WEB_HANS) that lets the wasm build embed that face too, so Edit text also works
-# for Simplified Chinese. On top of the static site Trunk leaves
+# for Simplified Chinese. Since v0.20.0 the app also ships Scan & OCR on the web, whose models
+# the page downloads from models/ beside index.html on first use; the workflow stages them
+# there the way upstream's own web packaging does. On top of the static site Trunk leaves
 # in dist/web, the workflow applies this repository's PWA layer (pwa/) — the web app manifest,
 # upstream's own app icon in the sizes installers ask for, and a service worker that caches the
 # build for offline use; see pwa/README.md — before deploying. Every URL in the generated
@@ -108,7 +110,7 @@ jobs:
           persist-credentials: false
 
       # This repository's one change to PdfCraft's source: patches/simplified-chinese-web-fallback
-      # .patch, generated against v0.19.0. Upstream reads craft-fonts' separate Simplified Chinese
+      # .patch, generated against v0.20.0. Upstream reads craft-fonts' separate Simplified Chinese
       # manifest — the LXGW WenKai Lite face Edit text falls back to for Simplified Chinese — in
       # native builds only; the patch adds the CRAFT_FONTS_WEB_HANS opt-in that lets a wasm build
       # embed that face too, plus the tests that keep the opt-in honest (patches/README.md has the
@@ -131,7 +133,7 @@ jobs:
       # The wasm build embeds the fallback fonts of the optional craft-fonts input (without them,
       # Edit text refuses Japanese text — the error names CRAFT_FONTS_DIR). PdfCraft's own release
       # recipe pins craft-fonts in its release.yml; read that pin so it tracks upstream, falling
-      # back to the pin of v0.19.0 (2026-11-07) if the file ever changes shape.
+      # back to the pin of v0.20.0 (2026-11-09) if the file ever changes shape.
       - name: Read the craft-fonts pin from PdfCraft's release recipe
         id: fonts
         run: |
@@ -139,7 +141,7 @@ jobs:
           fonts_ref=$(awk '/craft-fonts-ref/ { if (match($0, /[0-9a-f]{40}/)) { print substr($0, RSTART, RLENGTH); exit } }' \
             .github/workflows/release.yml || true)
           if [[ -z "$fonts_ref" ]]; then
-            echo "::warning::could not read the craft-fonts pin from PdfCraft's release.yml; using the pin of v0.19.0"
+            echo "::warning::could not read the craft-fonts pin from PdfCraft's release.yml; using the pin of v0.20.0"
             fonts_ref="b076417b5880bd4154bd22f00695b1d28c6bea83"
           fi
           echo "craft-fonts pin: $fonts_ref"
@@ -196,6 +198,20 @@ jobs:
       - name: Verify the Simplified Chinese faces are embedded
         run: python3 publisher/patches/verify-embedded-face.py dist/web craft-fonts
 
+      # v0.20.0's Scan & OCR downloads its models from models/ beside index.html the first time
+      # the feature is used. Upstream's own web packaging stages them there (packaging/web/
+      # package.sh's stage_models): `cargo xtask models` — an alias upstream's .cargo/config.toml
+      # defines — fetches every model named in upstream's ATTRIBUTION.toml, verifies each against
+      # the sha256 pinned there, and writes the attribution and licence files the models'
+      # CC-BY-SA-4.0 licence requires. The guard mirrors upstream's own stage_models: the step
+      # fails unless the attribution and every model's licence text came out with the models.
+      - name: Stage the OCR models
+        run: |
+          set -euo pipefail
+          cargo xtask models dist/web/models
+          ls dist/web/models/*.LICENCE.txt dist/web/models/ATTRIBUTION.txt >/dev/null
+          ls -l dist/web/models
+
       # PdfCraft is MIT OR Apache-2.0; redistribution carries its notices. The embedded craft-fonts
       # faces are OFL-1.1, whose licence must ship with them. The release zip does both through
       # copy_docs/copy_font_licences in packaging/env.sh.
@@ -237,9 +253,10 @@ jobs:
       - name: Add the PWA layer
         run: python3 publisher/pwa/apply.py dist/web
 
-      # The layer's harness: static checks on the applied site, then sw.js driven through a mock
+      # The layer's harness: static checks on the applied site (the injected links, the icons,
+      # the OCR worker's file chain, the staged models), then sw.js driven through a mock
       # service-worker environment — warm-up caching, the all-or-nothing build swap, offline
-      # navigation, and the files that must bypass the worker.
+      # navigation, the models' network-first serving, and the files that must bypass the worker.
       - name: Test the PWA layer
         run: node publisher/pwa/test-pwa.mjs dist/web
 

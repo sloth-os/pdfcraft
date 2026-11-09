@@ -2,7 +2,7 @@
 
 What this repository adds to upstream's build beyond building it: installability and offline
 use. Upstream's `apps/pdfcraft-web` build is a folder of static files with no manifest, no
-icons and no service worker — a browser tab that redownloads its ~73 MB wasm once Pages'
+icons and no service worker — a browser tab that redownloads its ~79 MB wasm once Pages'
 ten-minute cache has gone stale (every build renames the files anyway), and that is all it
 is. The publishing workflow applies this layer on top, and the site becomes something that
 installs to the home screen, loads instantly on repeat visits, and works on a plane.
@@ -46,19 +46,33 @@ workflow ships its licence file with the site as `LICENSE-app-icon.txt`.
 `sw.js` caches nothing from a list — the build's file names change with every build. Instead,
 once the running app announces it has started (Trunk's `TrunkApplicationStarted` event; the
 sender is injected into `index.html` by `apply.py`), the page asks the worker for a
-*warm-up*: fetch a fresh `index.html`, copy every file it references — plus the manifest,
-whose JSON names the icons — into Cache Storage, and only once **all** of them are in, let
-the new page replace the cached one and prune the previous build's hashed files. A partially
-fetched or broken deploy therefore never displaces a working build, and the cache stays one
-build (~73 MB) deep. Running after the page's own downloads means the warm-up's refetches
-come from the browser's HTTP cache, not the network.
+*warm-up*: fetch a fresh `index.html`, copy every file it references — the OCR worker's chain
+out to its wasm, plus the manifest, whose JSON names the icons — into Cache Storage, and only
+once **all** of them are in, let the new page replace the cached one and prune the previous
+build's hashed files. A partially fetched or broken deploy therefore never displaces a working
+build, and the cache stays one build (~83 MB) deep. Running after the page's own downloads
+means the warm-up's refetches come from the browser's HTTP cache, not the network — except
+the OCR worker's, which the page loads only when Scan & OCR is first used.
+
+The OCR worker (v0.20.0) is named in a chain, not in the page's links: a `<meta>` in
+`index.html` names the worker's loader script, whose code names the worker's glue script,
+whose code names the worker's wasm — upstream's build hook writes those names into the very
+files it hashes. The warm-up walks that chain, and touches only the worker's own files:
+scanning scripts at large would also pick up a fallback wasm name in the app's glue that
+nothing ever fetches.
+
+The OCR models under `models/` are named files (their names carry no hash, and they are
+staged once per release), so they are fetched network-first and never pruned — but the
+warm-up never fetches them. The page downloads a model on first use of Scan & OCR, and that
+fetch fills the cache, so the ~12 MB is spent by the visitors who use the feature — and OCR
+works offline for them from then on — rather than by every visitor on every warm-up.
 
 At fetch time: navigations to the app page are served from the cache (offline use), with a
 background refresh when online; hashed build assets are cache-first forever — their names
-carry their content's hash; the layer's own named files (manifest, icons) are network-first
-with the cached copy as the offline fallback. Everything else — licence files, `BUILD.txt`,
-a same-origin `?file=` document — bypasses the worker, so user documents never grow the
-cache. `sw.js` documents all of this in its header comment.
+carry their content's hash; named files (the manifest, the icons, the OCR models) are
+network-first with the cached copy as the offline fallback. Everything else — licence files,
+`BUILD.txt`, a same-origin `?file=` document — bypasses the worker, so user documents never
+grow the cache. `sw.js` documents all of this in its header comment.
 
 ## Applying and testing locally
 
@@ -69,7 +83,8 @@ python3 pwa/apply.py path/to/dist        # copies the layer in, injects into ind
 node pwa/test-pwa.mjs path/to/dist       # static checks + sw.js in a mock worker environment
 ```
 
-The harness needs what the build leaves in `dist/`: the real `index.html` and the hashed
-files it references (a stand-in fixture with the live page and placeholder files works),
-plus this layer. `apply.py` is idempotent — it replaces its earlier injection between
-`pwa:begin`/`pwa:end` markers — and the harness re-runs it to prove that.
+The harness needs what the build and the workflow leave in `dist/`: the real `index.html`
+and the hashed files it references — including the OCR worker's chain, which placeholders
+can stand in for — plus the `models/` directory the workflow stages and this layer. `apply.py`
+is idempotent — it replaces its earlier injection between `pwa:begin`/`pwa:end` markers —
+and the harness re-runs it to prove that.

@@ -20,10 +20,14 @@ This repository holds no PdfCraft source. It contains one workflow,
    `release.yml`, so the wasm embeds the fallback fonts (the Japanese face BIZ UDPGothic Regular
    and the small Arabic/Thai/Hebrew/Devanagari faces, plus the patch's Simplified Chinese face)
    and Edit text works for those scripts;
-4. applies this repository's PWA layer ([`pwa/`](pwa/README.md)) to the build: the web app
+4. stages the OCR models under `models/` beside the app, the way upstream's own web packaging
+   does (v0.20.0's Scan & OCR downloads them from there on first use; each is verified against
+   the sha256 pinned in upstream's ATTRIBUTION.toml and ships with its CC-BY-SA-4.0 licence
+   text and attribution);
+5. applies this repository's PWA layer ([`pwa/`](pwa/README.md)) to the build: the web app
    manifest, the app icons (upstream's own), the theme colour, and a service worker that caches
    the build for offline use — then runs the layer's test harness over the finished site;
-5. deploys the static site to GitHub Pages.
+6. deploys the static site to GitHub Pages.
 
 It runs on every push to `main`, once a day (03:17 UTC), and manually from the Actions tab
 (*Run workflow* → optional `pdfcraft-ref`: branch, tag or SHA; empty means the newest release).
@@ -33,8 +37,10 @@ run always works, and the schedule can be re-enabled from the Actions tab.
 All URLs in the generated `index.html` are relative, so the site works under the `/pdfcraft/`
 path GitHub Pages serves it from — and inside an `<iframe>`. Hosting notes and URL flags
 (`?file=`, `?webgl`, `?cpu`) are in [PdfCraft's packaging/web/README.md][hosting]. PdfCraft is
-MIT OR Apache-2.0 and the embedded craft-fonts faces are OFL-1.1; the site ships both sets of
-licence files, and `BUILD.txt` names the upstream commit and craft-fonts pin it was built from.
+MIT OR Apache-2.0, the embedded craft-fonts faces are OFL-1.1 and the OCR models are
+CC-BY-SA-4.0; the site ships each set's licence files (the models' attribution is
+`models/ATTRIBUTION.txt`), and `BUILD.txt` names the upstream commit and craft-fonts pin it
+was built from.
 
 ## PWA: install and offline
 
@@ -45,8 +51,9 @@ to start, and from then on it loads with no network at all. Behind that is [`pwa
 files into Cache Storage once the app has started. Because every build renames those files, the
 worker caches them by reading a fresh `index.html` rather than from a fixed list, and swaps a new
 build in only once every one of its files is cached — a partial or broken deploy never displaces
-the working one. Repeat visits are served from the cache, so the ~73 MB wasm downloads once per
-build instead of once per stale cache. Everything the layer does is documented in
-[`pwa/README.md`](pwa/README.md) and `pwa/sw.js`.
+the working one. Repeat visits are served from the cache, so the ~79 MB wasm downloads once per
+build instead of once per stale cache. Scan & OCR works offline too: the OCR worker's files are
+warmed up with the build, and the models are cached as the page downloads them on first use.
+Everything the layer does is documented in [`pwa/README.md`](pwa/README.md) and `pwa/sw.js`.
 
 [hosting]: https://github.com/storytold/pdfcraft/blob/main/packaging/web/README.md

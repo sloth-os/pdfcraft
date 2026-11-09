@@ -2,8 +2,9 @@
 // (https://sloth-os.github.io/pdfcraft/). Upstream's web build is a folder of static files
 // whose asset names carry a content hash, served by GitHub Pages with `Cache-Control:
 // max-age=600` — and every build renames them anyway — so out of the box the app
-// redownloads its ~73 MB wasm on every visit once the HTTP cache has gone stale. This
-// worker adds what upstream's packaging does not:
+// redownloads its ~79 MB of wasm on every visit — and the OCR worker's ~3 MB on the first
+// use of Scan & OCR — once the HTTP cache has gone stale. This worker adds what upstream's
+// packaging does not:
 //
 //   * offline use: the files the page loads are kept in Cache Storage; a navigation to the
 //     app answers from there when the network is gone;
@@ -13,15 +14,22 @@
 // Nothing is precached from a list — the names change with every build. Instead the page
 // asks for a "warm-up" (the sender is injected into index.html by pwa/apply.py) once the
 // wasm has been fetched and started; the worker then reads a fresh index.html and copies
-// this build's files — the page, its scripts, the wasm, the manifest and the icons — into
-// the cache. Only when every one of them is in does the new page replace the cached one
-// and the previous build's hashed files get pruned, so the cache stays one build deep and
-// whatever page it holds always boots. Running after the page's own downloads means the
-// warm-up's refetches are served by the browser's HTTP cache, not the network.
+// this build's files — the page, its scripts, the wasm, the OCR worker the page names in a
+// <meta> (whose loader script names the worker's glue, whose glue names its wasm), the
+// manifest and the icons — into the cache. Only when every one of them is in does the new
+// page replace the cached one and the previous build's hashed files get pruned, so the
+// cache stays one build deep and whatever page it holds always boots. Running after the
+// page's own downloads means the warm-up's refetches are served by the browser's HTTP
+// cache, not the network — the OCR worker's files excepted: the page loads them only when
+// Scan & OCR is first used, so the warm-up may have to download those (~3 MB) itself.
 //
 // Named files — the manifest, the icons, the licence files, BUILD.txt — keep their names
 // across builds and can change under them, so they are fetched network-first with the
-// cached copy as the offline fallback, and never pruned.
+// cached copy as the offline fallback, and never pruned. The OCR models under models/ are
+// named files too, but the warm-up never fetches them: the page downloads a model on first
+// use of Scan & OCR, and that fetch fills the cache, so the ~12 MB is spent by the visitors
+// who use the feature — and OCR works offline for them from then on — rather than by every
+// visitor on every warm-up.
 
 const CACHE = "pdfcraft-v1";
 const SCOPE = self.registration.scope; // .../pdfcraft/, with the trailing slash
@@ -31,13 +39,17 @@ const SHELL_PATH = new URL(SHELL).pathname; // "/pdfcraft/index.html"
 const MANIFEST_URL = new URL("manifest.webmanifest", SCOPE).href;
 
 // Trunk and wasm-bindgen hash every build artifact's name — pdfcraft-web-<hash>.js,
-// pdfcraft-web-<hash>_bg.wasm, snippets/<crate>-<hash>/inline0.js. A name changes with
-// each build; the content behind a name never does, so those files are served cache-first
-// and pruned with their build.
-const BUILD_ASSET = /(?:^|\/)pdfcraft-web-[0-9a-f]{8,}(?:_[a-z0-9]+)*\.(?:js|wasm)$|\/snippets\/.+\.js$/;
-// This layer's own files, which keep their names across builds and can change under them:
-// network-first, never pruned. Keep in step with manifest.webmanifest and apply.py.
-const LAYER_FILE = /(?:^|\/)(?:manifest\.webmanifest|icon-(?:32|192|512)\.png|icon-maskable-512\.png|apple-touch-icon\.png)$/;
+// pdfcraft-web-<hash>_bg.wasm, snippets/<crate>-<hash>/inline0.js — and v0.20.0's build
+// adds the OCR worker's three files under the same scheme: pdfcraft-ocr-worker-<hash>.js,
+// pdfcraft-ocr-worker-<hash>_loader.js and pdfcraft-ocr-worker-<hash>_bg.wasm. A name
+// changes with each build; the content behind a name never does, so those files are served
+// cache-first and pruned with their build.
+const BUILD_ASSET = /(?:^|\/)(?:pdfcraft-web|pdfcraft-ocr-worker)-[0-9a-f]{8,}(?:_[a-z0-9]+)*\.(?:js|wasm)$|\/snippets\/.+\.js$/;
+// Named files, which keep their names across builds and can change under them: fetched
+// network-first, never pruned. This layer's own (keep in step with manifest.webmanifest
+// and apply.py) — and the OCR models, whose names carry no hash and are staged once per
+// release, so a new build must not prune them; the header notes how they get cached.
+const LAYER_FILE = /(?:^|\/)(?:manifest\.webmanifest|icon-(?:32|192|512)\.png|icon-maskable-512\.png|apple-touch-icon\.png)$|(?:^|\/)models\/[^/]+$/;
 
 self.addEventListener("install", () => {
   // No precache list to install (see above); the warm-up fills the cache after the page
@@ -135,9 +147,9 @@ async function assets(request) {
 }
 
 // Copy this build's files into the cache: read a fresh index.html, fetch every local file
-// it references — and the manifest, whose JSON names this layer's icons — and only once
-// all of them are cached let the new page replace the cached one and the previous build's
-// hashed files go.
+// it references — the OCR worker's chain out to its wasm, and the manifest, whose JSON
+// names this layer's icons — and only once all of them are cached let the new page replace
+// the cached one and the previous build's hashed files go.
 async function warmUp() {
   const cache = await caches.open(CACHE);
   // `cache: "reload"` bypasses the browser's HTTP cache: this one request must see the
@@ -166,9 +178,30 @@ async function warmUp() {
     referenced.add(new URL(match[1], SHELL).href);
   }
 
+  // The OCR worker's files are named in a chain, not in the page's links: the <meta> the
+  // build hook writes names the worker's loader, whose script quotes the worker's glue,
+  // whose script quotes the worker's wasm. Walk that chain, adding each name for the fill
+  // below — touching only the worker's own files, because scanning scripts at large would
+  // also pick up the app glue's 'pdfcraft-web_bg.wasm', a fallback name nothing fetches.
+  const meta = html.match(/<meta(?=[^>]*name="pdfcraft-ocr-worker")[^>]*content="([^"]+)"/);
+  let link = meta ? new URL(meta[1], SHELL).href : null;
+  const seen = new Set();
+  while (link && !link.endsWith(".wasm")) {
+    if (seen.has(link)) return; // a chain that loops is malformed
+    seen.add(link);
+    referenced.add(link);
+    const script = await fetch(link);
+    if (!script.ok) return; // a broken worker chain must not displace the working build
+    const quoted = (await script.text()).match(/'([^']+\.(?:js|wasm))'/);
+    if (!quoted) return; // ditto a malformed one
+    link = new URL(quoted[1], SHELL).href;
+  }
+  if (link) referenced.add(link); // the worker's wasm
+
   // Fill the gaps — through the page's HTTP cache, which holds everything it just
-  // downloaded. Build assets already stored are skipped: their content cannot have
-  // changed. A file that cannot be fetched marks the fill incomplete.
+  // downloaded (the worker files above are the exception; the header explains why). Build
+  // assets already stored are skipped: their content cannot have changed. A file that
+  // cannot be fetched marks the fill incomplete.
   let complete = true;
   for (const url of referenced) {
     if (url === SHELL) continue; // the page itself is held back until the fill is complete
@@ -202,7 +235,7 @@ async function warmUp() {
   if (!complete) return; // the working build stays; the next visit's warm-up retries
 
   // Every file of this build is cached: its page can replace the cached one, and the
-  // previous build's hashed files can go — the cache stays one build (~73 MB) deep.
+  // previous build's hashed files can go — the cache stays one build (~83 MB) deep.
   await cache.put(SHELL, page);
   for (const request of await cache.keys()) {
     if (BUILD_ASSET.test(new URL(request.url).pathname) && !referenced.has(request.url)) {
