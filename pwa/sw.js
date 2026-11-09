@@ -2,7 +2,7 @@
 // (https://sloth-os.github.io/pdfcraft/). Upstream's web build is a folder of static files
 // whose asset names carry a content hash, served by GitHub Pages with `Cache-Control:
 // max-age=600` — and every build renames them anyway — so out of the box the app
-// redownloads its ~60 MB wasm on every visit once the HTTP cache has gone stale. This
+// redownloads its ~73 MB wasm on every visit once the HTTP cache has gone stale. This
 // worker adds what upstream's packaging does not:
 //
 //   * offline use: the files the page loads are kept in Cache Storage; a navigation to the
@@ -202,7 +202,7 @@ async function warmUp() {
   if (!complete) return; // the working build stays; the next visit's warm-up retries
 
   // Every file of this build is cached: its page can replace the cached one, and the
-  // previous build's hashed files can go — the cache stays one build (~60 MB) deep.
+  // previous build's hashed files can go — the cache stays one build (~73 MB) deep.
   await cache.put(SHELL, page);
   for (const request of await cache.keys()) {
     if (BUILD_ASSET.test(new URL(request.url).pathname) && !referenced.has(request.url)) {

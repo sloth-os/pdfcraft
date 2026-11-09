@@ -1,0 +1,423 @@
+diff --git a/crates/edit/src/tests.rs b/crates/edit/src/tests.rs
+index 22fbd6e8..679432f4 100644
+--- a/crates/edit/src/tests.rs
++++ b/crates/edit/src/tests.rs
+@@ -1483,6 +1483,19 @@ fn without_craft_fonts(test: &str) -> bool {
+     true
+ }
+ 
++/// The Simplified Chinese fallback face comes from craft-fonts' separate Chinese manifest, which
++/// a wasm build embeds only behind CRAFT_FONTS_WEB_HANS.
++fn without_chinese_fonts(test: &str) -> bool {
++    if pdfcraft_fonts::document_chinese_fonts().is_empty() {
++        eprintln!(
++            "skipping {test}: built without the craft-fonts Simplified Chinese face (set CRAFT_FONTS_DIR; a wasm build also needs CRAFT_FONTS_WEB_HANS)"
++        );
++        true
++    } else {
++        false
++    }
++}
++
+ #[test]
+ fn japanese_line_uses_unicode_type3_fallback() {
+     if without_craft_fonts("japanese_line_uses_unicode_type3_fallback") {
+@@ -1669,6 +1682,42 @@ fn cyrillic_the_japanese_faces_carry_keeps_them() {
+     assert_eq!(edit.substituted.as_deref(), Some(expected.as_str()));
+ }
+ 
++/// Simplified Chinese text no Japanese face can wholly draw (潇 and 测 are Simplified-only) takes
++/// the Chinese face (LXGW WenKai Lite), in its own generated font.
++#[test]
++fn simplified_chinese_text_uses_the_chinese_fallback_face() {
++    if without_chinese_fonts("simplified_chinese_text_uses_the_chinese_fallback_face") {
++        return;
++    }
++    for paragraph in [false, true] {
++        let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
++        let replacement = "潇洒的测试段落，第二行也认识。";
++        let edit =
++            if paragraph { text::replace_block(&mut doc, 0, 0, replacement) } else { text::replace_line(&mut doc, 0, 0, replacement) }.unwrap();
++        assert_eq!(edit.substituted.as_deref(), Some("LXGW WenKai Lite Type3"), "{replacement}: {edit:?}");
++        let content = String::from_utf8_lossy(&page_content_bytes(&doc, 0)).into_owned();
++        assert!(content.contains("/PCZh"), "{replacement}: {content}");
++        assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, replacement);
++    }
++}
++
++/// A character only the Chinese face has rides along in the leading Japanese font's glyphs, as
++/// Hebrew does (伖 is in the Japanese faces and not the Chinese one, 潇 the other way round, so no
++/// face has the whole text): the Japanese face keeps the line, and no Chinese font appears.
++#[test]
++fn a_simplified_only_character_rides_in_the_japanese_fallback_font() {
++    if without_chinese_fonts("a_simplified_only_character_rides_in_the_japanese_fallback_font") {
++        return;
++    }
++    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
++    let edit = text::replace_line(&mut doc, 0, 0, "伖潇").unwrap();
++    assert_eq!(edit.substituted.as_deref(), Some("BIZ UDPGothic Type3"), "{edit:?}");
++    let content = String::from_utf8_lossy(&page_content_bytes(&doc, 0)).into_owned();
++    assert!(content.contains("/PCJp"), "{content}");
++    assert!(!content.contains("/PCZh"), "{content}");
++    assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, "伖潇");
++}
++
+ #[test]
+ fn japanese_paragraph_uses_unicode_type3_fallback() {
+     if without_craft_fonts("japanese_paragraph_uses_unicode_type3_fallback") {
+@@ -2033,8 +2082,13 @@ fn japanese_replacement_missing_a_glyph_after_240_changes_nothing() {
+     if without_craft_fonts("japanese_replacement_missing_a_glyph_after_240_changes_nothing") {
+         return;
+     }
+-    // The first CJK character that no face draws: the 242nd unique character, in a second font.
+-    let faces = pdfcraft_fonts::document_japanese_fonts_for_style(false, false);
++    // The first CJK character that no face in the fallback chain draws (Japanese, then the
++    // bundled Latin face, then Simplified Chinese): the 242nd unique character, in a second
++    // font. The whole chain matters: a character the Japanese faces lack can be in the Chinese
++    // one, which then draws it as a donor instead of refusing.
++    let mut faces = pdfcraft_fonts::document_japanese_fonts_for_style(false, false);
++    faces.extend(pdfcraft_fonts::document_latin_fonts(false));
++    faces.extend(pdfcraft_fonts::document_chinese_fonts());
+     let missing = (0x4E00u32..0x9FFF)
+         .filter_map(char::from_u32)
+         .find(|ch| faces.iter().all(|face| pdfcraft_fonts::japanese_glyph_from(face, *ch).is_err()))
+diff --git a/crates/edit/src/text.rs b/crates/edit/src/text.rs
+index 3d1626a5..280bd34a 100644
+--- a/crates/edit/src/text.rs
++++ b/crates/edit/src/text.rs
+@@ -290,18 +290,21 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn hebrew_and_japanese_fallback_shards_are_recognized_as_ours() {
++    fn hebrew_japanese_and_chinese_fallback_shards_are_recognized_as_ours() {
+         static HEBR: &[&str] = &["Hebr"];
++        static HANS: &[&str] = &["Hani", "Hans"];
+         let face = CraftFont { family: "FakeHebrew", style: "Regular", scripts: HEBR, bytes: b"" };
++        let hans = CraftFont { family: "FakeHans", style: "Regular", scripts: HANS, bytes: b"" };
+         let glyph = |code, ch| Type3Glyph { code, ch, path: b"0 0 0 0 0 0 d1\nf\n".to_vec(), width: 0.5 };
+         let mut doc = Document::new_empty();
+         let mut fonts = Dict::new();
+-        // A replacement split across two Hebrew fonts, then one Japanese font.
++        // A replacement split across two Hebrew fonts, then one Japanese font, then one Chinese.
+         let he = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'א')]);
+         let he1 = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'ב')]);
+         let jp = add_type3_font(&mut doc, &mut fonts, &face, false, vec![glyph(1, 'あ')]);
+-        assert_eq!([he.as_str(), he1.as_str(), jp.as_str()], ["PCHe", "PCHe1", "PCJp"]);
+-        for name in [&he, &he1, &jp] {
++        let zh = add_type3_font(&mut doc, &mut fonts, &hans, false, vec![glyph(1, '潇')]);
++        assert_eq!([he.as_str(), he1.as_str(), jp.as_str(), zh.as_str()], ["PCHe", "PCHe1", "PCJp", "PCZh"]);
++        for name in [&he, &he1, &jp, &zh] {
+             let font = fonts.get(name.as_bytes()).and_then(Object::as_dict).cloned().unwrap_or_default();
+             assert!(is_type3_fallback(&font), "{name} isn't recognized as a generated fallback font");
+         }
+diff --git a/crates/edit/src/text/fallback.rs b/crates/edit/src/text/fallback.rs
+index 469d1739..9e084657 100644
+--- a/crates/edit/src/text/fallback.rs
++++ b/crates/edit/src/text/fallback.rs
+@@ -24,22 +24,31 @@ const HEBREW_FONT_NAME: &str = "PCHebrew";
+ /// The `/Name` of the Type 3 fonts generated from the bundled Latin (Inter) face.
+ const LATIN_FONT_NAME: &str = "PCLatin";
+ 
+-/// Whether `font` is one of those generated fonts (Latin, Japanese or Hebrew): a replacement longer
+-/// than one of them is split across several, which read back as one line (see [`same_font`]).
++/// The `/Name` of the Type 3 fonts generated for Simplified Chinese text.
++const CHINESE_FONT_NAME: &str = "PCChinese";
++
++/// Whether `font` is one of those generated fonts (Latin, Japanese, Chinese or Hebrew): a
++/// replacement longer than one of them is split across several, which read back as one line
++/// (see [`same_font`]).
+ pub(super) fn is_type3_fallback(font: &Dict) -> bool {
+     font.name(b"Subtype") == Some(b"Type3")
+-        && font
+-            .name(b"Name")
+-            .is_some_and(|n| n == JAPANESE_FONT_NAME.as_bytes() || n == HEBREW_FONT_NAME.as_bytes() || n == LATIN_FONT_NAME.as_bytes())
++        && font.name(b"Name").is_some_and(|n| {
++            n == JAPANESE_FONT_NAME.as_bytes()
++                || n == HEBREW_FONT_NAME.as_bytes()
++                || n == LATIN_FONT_NAME.as_bytes()
++                || n == CHINESE_FONT_NAME.as_bytes()
++        })
+ }
+ 
+-/// The generated font's `/Name` and its resource prefix: the bundled Latin face, Hebrew, or the
+-/// Japanese ones.
++/// The generated font's `/Name` and its resource prefix: the bundled Latin face, Hebrew, the
++/// Japanese ones, or the Simplified Chinese one.
+ fn fallback_names(face: &CraftFont, hebrew: bool) -> (&'static str, &'static str) {
+     if hebrew {
+         (HEBREW_FONT_NAME, "PCHe")
+     } else if face.family == "Inter" {
+         (LATIN_FONT_NAME, "PCLat")
++    } else if face.covers("Hans") {
++        (CHINESE_FONT_NAME, "PCZh")
+     } else {
+         (JAPANESE_FONT_NAME, "PCJp")
+     }
+@@ -191,7 +200,7 @@ pub(crate) struct Type3Fallback {
+     /// The family its glyphs come from ("Shippori Mincho").
+     pub(crate) family: &'static str,
+     /// The fonts' resource names in order; the first is `PCJp` (`PCLat` for the bundled Latin
+-    /// face, `PCHe` for Hebrew text).
++    /// face, `PCZh` for the Simplified Chinese one, `PCHe` for Hebrew text).
+     pub(crate) names: Vec<String>,
+     /// Every unique character with its advance (em), in order of first appearance.
+     pub(super) widths: Vec<(char, f64)>,
+@@ -338,12 +347,17 @@ fn no_hebrew_font() -> EditError {
+ /// Hebrew face first (its Latin and digits too, so a line keeps one look), then the Japanese faces
+ /// and the bundled Latin one for anything it lacks; other text takes the Japanese faces, and the
+ /// bundled Latin face behind them, which covers the Latin, Greek and Cyrillic letters they lack
+-/// (#2593: the Japanese faces have no қ, ғ, ҳ, ә, ө, ү, ұ or һ).
++/// (#2593: the Japanese faces have no қ, ғ, ҳ, ә, ө, ү, ұ or һ). The Simplified Chinese face
++/// (LXGW WenKai Lite, craft-fonts' separate Chinese manifest) comes strictly last, for the
++/// Simplified-only characters (潇, 测) no Japanese face has: it covers the Cyrillic the Japanese
++/// faces lack too, so ahead of the bundled Latin face it would take the letters that face is
++/// pinned for, and ahead of a Japanese face it would displace it for text both can draw.
+ pub(crate) fn type3_faces(text: &str, family: crate::added::Family, bold: bool) -> Result<(Vec<&'static CraftFont>, bool), EditError> {
+     let japanese = pdfcraft_fonts::document_japanese_fonts_for_style(family == crate::added::Family::Times, bold);
+     let latin = pdfcraft_fonts::document_latin_fonts(bold);
++    let chinese = pdfcraft_fonts::document_chinese_fonts();
+     if !text.chars().any(crate::bidi::is_hebrew) {
+-        return Ok((japanese.into_iter().chain(latin).collect(), false));
++        return Ok((japanese.into_iter().chain(latin).chain(chinese).collect(), false));
+     }
+     // Points are drawn on their letter with the font's positioning, which a one-glyph-per-
+     // character Type 3 font can't do; refuse rather than print them beside the letter.
+@@ -351,7 +365,7 @@ pub(crate) fn type3_faces(text: &str, family: crate::added::Family, bold: bool)
+         return Err(EditError::Invalid("Hebrew points (niqqud) can't be written into a PDF yet; type the text without them".into()));
+     }
+     let hebrew = pdfcraft_fonts::document_hebrew_font(bold).ok_or_else(no_hebrew_font)?;
+-    Ok((std::iter::once(hebrew).chain(japanese).chain(latin).collect(), true))
++    Ok((std::iter::once(hebrew).chain(japanese).chain(latin).chain(chinese).collect(), true))
+ }
+ 
+ pub(super) fn type3_font(
+@@ -375,18 +389,21 @@ pub(super) fn type3_font(
+         return Err(EditError::Invalid("replacement text is empty".into()));
+     }
+     // The faces differ in coverage (e.g. of Cyrillic), so use the best face that has every
+-    // character. When none has them all, the best face reports the character it lacks. Hebrew
+-    // text keeps the Hebrew face and takes each character it lacks from the next face that has it.
++    // character. When none has them all, the best face leads and each character it lacks is
++    // taken from the next face that has it: Hebrew text keeps the Hebrew face that way, and
++    // Japanese text keeps its face with a Simplified-only character (潇) drawn by the Chinese
++    // face behind it.
+     let face = if hebrew { faces.first().copied() } else { fallback_face(&faces, &chars, |face, ch| japanese_glyph_from(face, ch).is_ok()) }
+         .ok_or_else(|| no_fallback_font(text))?;
+-    let others: &[&CraftFont] = if hebrew { faces.get(1..).unwrap_or_default() } else { &[] };
++    let others: &[&CraftFont] = faces.get(1..).unwrap_or_default();
+     // Every outline is read before the document is touched, so a character that fails leaves it
+     // as it was. Each font takes the next `per_font` characters; codes restart at 1 in each.
+     let per_font = max_glyphs.clamp(1, MAX_TYPE3_GLYPHS);
+     let mut glyphs = Vec::with_capacity(chars.len());
+     for (i, ch) in chars.into_iter().enumerate() {
+-        // The chosen face first, then the faces after it (Hebrew text takes a character the Hebrew
+-        // face lacks from the next face that has it); a character no face draws is reported once.
++        // The chosen face first, then the faces after it (a character the chosen face lacks —
++        // Hebrew from the Hebrew face, a Simplified-only character from a Japanese one — is
++        // taken from the next face that has it); a character no face draws is reported once.
+         let mut drawn = type3_glyph(face, ch)?;
+         for f in others.iter().copied() {
+             if drawn.is_some() {
+@@ -431,8 +448,8 @@ pub(crate) fn write_type3_glyphs(
+ }
+ 
+ /// Adds one generated font whose codes 1 to `glyphs.len()` show `glyphs`, and returns its resource
+-/// name (`PCLat`, `PCJp`, then `PCJp1`, ...; `PCHe`, ... for Hebrew text). Nothing here can fail: the
+-/// outlines were read already.
++/// name (`PCLat`, `PCJp`, `PCZh`, then `PCJp1`, ...; `PCHe`, ... for Hebrew text). Nothing here
++/// can fail: the outlines were read already.
+ pub(super) fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &CraftFont, hebrew: bool, glyphs: Vec<Type3Glyph>) -> String {
+     let last_char = glyphs.len();
+     let mut charprocs = Dict::new();
+diff --git a/crates/fonts/build.rs b/crates/fonts/build.rs
+index 980c1957..39359085 100644
+--- a/crates/fonts/build.rs
++++ b/crates/fonts/build.rs
+@@ -3,8 +3,9 @@
+ //! the local checkout (no network). On wasm32 it embeds only the UI faces (BIZ UDPGothic Regular
+ //! and any `Arab`, `Telu`, `Hebr`, `Thai` or `Deva` face), to keep the web build within hosting
+ //! limits (Cloudflare Pages: 25 MiB per file). Native builds also read the optional
+-//! `fonts/simplified-chinese-manifest.txt` (LXGW WenKai Lite); it is never embedded on wasm.
+-//! `CRAFT_FONTS_REQUIRED` makes both the checkout and that native manifest required.
++//! `fonts/simplified-chinese-manifest.txt` (LXGW WenKai Lite); a wasm build reads it too, and so
++//! embeds the Simplified Chinese fallback, when `CRAFT_FONTS_WEB_HANS` is set.
++//! `CRAFT_FONTS_REQUIRED` makes both the checkout and that manifest required.
+ 
+ use std::fmt::Write as _;
+ use std::path::PathBuf;
+@@ -17,10 +18,13 @@ mod cjk_scripts;
+ fn main() {
+     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_DIR");
+     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_REQUIRED");
++    println!("cargo::rerun-if-env-changed=CRAFT_FONTS_WEB_HANS");
+     let mut src = String::from("pub static CRAFT_FONTS: &[CraftFont] = &[\n");
+     let required = std::env::var_os("CRAFT_FONTS_REQUIRED").is_some();
++    let wasm = std::env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "wasm32");
++    let web_hans = std::env::var_os("CRAFT_FONTS_WEB_HANS").is_some();
+     if let Some(dir) = std::env::var_os("CRAFT_FONTS_DIR").map(PathBuf::from) {
+-        match craft_fonts(&dir, required) {
++        match craft_fonts(&dir, required, wasm, web_hans) {
+             Ok(entries) => src.push_str(&entries),
+             Err(e) if required => println!("cargo::error=CRAFT_FONTS_DIR={}: {e}", dir.display()),
+             Err(e) => println!("cargo::warning=building without craft-fonts: CRAFT_FONTS_DIR={}: {e}", dir.display()),
+@@ -29,19 +33,22 @@ fn main() {
+         println!("cargo::error=CRAFT_FONTS_REQUIRED is set but CRAFT_FONTS_DIR is missing");
+     }
+     src.push_str("];\n");
++    // Whether this build set CRAFT_FONTS_WEB_HANS: the tests in src/craft.rs let the native-UI
++    // faces into a wasm payload only when it did.
++    let _ = writeln!(src, "pub static CRAFT_FONTS_WEB_HANS: bool = {};", web_hans);
+     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join("craft_fonts.rs");
+     if let Err(e) = std::fs::write(&out, src) {
+         println!("cargo::error=writing {}: {e}", out.display());
+     }
+ }
+ 
+-/// The main manifest, plus the native-only Simplified Chinese manifest. The latter is optional
+-/// for ordinary builds and required when `CRAFT_FONTS_REQUIRED` is set, so a required build can
+-/// never pass the Chinese UI tests only by skipping them.
+-fn craft_fonts(dir: &std::path::Path, required: bool) -> Result<String, String> {
+-    let wasm = std::env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "wasm32");
++/// The main manifest, plus the Simplified Chinese manifest. The latter is read by every native
++/// build and, behind the `CRAFT_FONTS_WEB_HANS` opt-in, by wasm builds too; it is optional for
++/// ordinary builds and required when `CRAFT_FONTS_REQUIRED` is set, so a required build can never
++/// pass the Chinese UI tests only by skipping them.
++fn craft_fonts(dir: &std::path::Path, required: bool, wasm: bool, web_hans: bool) -> Result<String, String> {
+     let mut out = manifest(dir, &dir.join("fonts/manifest.txt"), wasm, false)?;
+-    if !wasm {
++    if !wasm || web_hans {
+         let chinese = dir.join("fonts/simplified-chinese-manifest.txt");
+         println!("cargo::rerun-if-changed={}", chinese.display());
+         match chinese.try_exists() {
+@@ -64,15 +71,16 @@ fn craft_fonts(dir: &std::path::Path, required: bool) -> Result<String, String>
+ 
+ /// One `CraftFont { .. }` initialiser per manifest line.
+ ///
+-/// `strict_cap` is set for the required native Simplified Chinese manifest: a face that does not
+-/// fit its cap must fail the build rather than be silently left out, so a required build cannot
+-/// pass without the Chinese face it promises.
++/// `strict_cap` is set for the required Simplified Chinese manifest (native builds always, wasm
++/// ones behind `CRAFT_FONTS_WEB_HANS`): a face that does not fit its cap must fail the build
++/// rather than be silently left out, so a required build cannot pass without the Chinese face it
++/// promises.
+ fn manifest(dir: &std::path::Path, manifest: &std::path::Path, wasm: bool, strict_cap: bool) -> Result<String, String> {
+     println!("cargo::rerun-if-changed={}", manifest.display());
+     let text = std::fs::read_to_string(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
+     let mut out = String::new();
+-    // A required native Chinese manifest must add the Hans face itself, not merely some other
+-    // CJK face that happens to fit: otherwise CRAFT_FONTS_REQUIRED would pass while the promised
++    // A required Chinese manifest must add the Hans face itself, not merely some other CJK face
++    // that happens to fit: otherwise CRAFT_FONTS_REQUIRED would pass while the promised
+     // Simplified Chinese fallback is still absent.
+     let mut has_hans = false;
+     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+@@ -156,4 +164,20 @@ mod manifest_tests {
+         assert!(manifest(&root, &path, false, true).is_err(), "a missing Hans asset cannot satisfy required input");
+         std::fs::remove_dir_all(root).unwrap();
+     }
++
++    /// A wasm build reads the Chinese manifest, and so embeds its Hans face, only behind the
++    /// `CRAFT_FONTS_WEB_HANS` opt-in; a native build reads it either way.
++    #[test]
++    fn wasm_embeds_the_chinese_manifest_only_behind_the_opt_in() {
++        let root = std::env::temp_dir().join(format!("pdfcraft-web-hans-{}", std::process::id()));
++        std::fs::create_dir_all(root.join("fonts")).unwrap();
++        std::fs::write(root.join("face.ttf"), b"synthetic manifest fixture").unwrap();
++        std::fs::write(root.join("fonts/manifest.txt"), "Fixture | Regular | face.ttf | Latn\n").unwrap();
++        std::fs::write(root.join("fonts/simplified-chinese-manifest.txt"), "FakeHans | Regular | face.ttf | Hani,Hans\n").unwrap();
++        let embeds_hans = |wasm: bool, web_hans: bool| craft_fonts(&root, false, wasm, web_hans).unwrap().contains("FakeHans");
++        assert!(!embeds_hans(true, false), "a wasm build without the opt-in embeds no Hans face");
++        assert!(embeds_hans(true, true), "the opt-in reads the Chinese manifest on wasm");
++        assert!(embeds_hans(false, false), "a native build reads it either way");
++        std::fs::remove_dir_all(root).unwrap();
++    }
+ }
+diff --git a/crates/fonts/src/cjk_scripts.rs b/crates/fonts/src/cjk_scripts.rs
+index 1058c6e6..53ec1bbb 100644
+--- a/crates/fonts/src/cjk_scripts.rs
++++ b/crates/fonts/src/cjk_scripts.rs
+@@ -8,8 +8,9 @@ pub const WHOLE_CJK_FAMILIES: [&str; 3] = ["Shippori Mincho", "BIZ UDPGothic", "
+ /// Any other CJK face over this size is left out.
+ pub const MAX_OTHER_CJK_BYTES: u64 = 4 << 20;
+ 
+-/// Reviewed native-only UI fallback from the separate Chinese manifest.
+-/// It is never included in the browser payload. Other CJK families keep the 4 MiB cap.
++/// Reviewed UI fallback from the separate Chinese manifest: native builds always read that
++/// manifest, a wasm one only behind the `CRAFT_FONTS_WEB_HANS` opt-in. Other CJK families keep
++/// the 4 MiB cap.
+ pub const NATIVE_UI_CJK_FAMILIES: [&str; 1] = ["LXGW WenKai Lite"];
+ pub const MAX_NATIVE_UI_CJK_BYTES: u64 = 16 << 20;
+ 
+diff --git a/crates/fonts/src/craft.rs b/crates/fonts/src/craft.rs
+index dff96762..9e733d80 100644
+--- a/crates/fonts/src/craft.rs
++++ b/crates/fonts/src/craft.rs
+@@ -152,6 +152,14 @@ pub fn document_japanese_fonts_for_style(serif: bool, bold: bool) -> Vec<&'stati
+     document_faces(CRAFT_FONTS, serif, bold)
+ }
+ 
++/// The `Hans` craft-fonts faces for Simplified Chinese text written into PDFs, in manifest order
++/// (LXGW WenKai Lite). The editor chains them behind the Japanese and bundled Latin faces, for
++/// the Simplified-only characters (潇, 测) no Japanese face has. Empty without craft-fonts or
++/// without its Chinese manifest, which a wasm build embeds only behind `CRAFT_FONTS_WEB_HANS`.
++pub fn document_chinese_fonts() -> Vec<&'static CraftFont> {
++    CRAFT_FONTS.iter().filter(|f| f.covers("Hans")).collect()
++}
++
+ /// The scripts the bundled Inter faces are for.
+ static LATIN_SCRIPTS: &[&str] = &["Latn", "Cyrl", "Grek"];
+ 
+@@ -315,10 +323,10 @@ mod tests {
+     }
+ 
+     /// `build.rs` embeds the Japanese CJK faces whole and any other CJK face only up to
+-    /// `MAX_OTHER_CJK_BYTES` (the explicitly pinned native-only LXGW UI fallback has a separate
+-    /// 16 MiB cap), so a checkout with a large Chinese or Korean face (craft-fonts has the
+-    /// 16.4 MB Noto Sans CJK SC) leaves it out. The four Japanese faces of the pinned craft-fonts
+-    /// are 24.1 MB.
++    /// `MAX_OTHER_CJK_BYTES` (the separately pinned LXGW UI fallback — embedded even on wasm
++    /// behind `CRAFT_FONTS_WEB_HANS` — has a separate 16 MiB cap), so a checkout with a large
++    /// Chinese or Korean face (craft-fonts has the 16.4 MB Noto Sans CJK SC) leaves it out.
++    /// The four Japanese faces of the pinned craft-fonts are 24.1 MB.
+     #[test]
+     fn cjk_faces_follow_the_size_rule() {
+         use crate::cjk_scripts::{MAX_NATIVE_UI_CJK_BYTES, MAX_OTHER_CJK_BYTES, NATIVE_UI_CJK_FAMILIES, WHOLE_CJK_FAMILIES, is_cjk_script};
+@@ -330,7 +338,10 @@ mod tests {
+         for face in &other {
+             let len = face.bytes.len();
+             let native_ui = NATIVE_UI_CJK_FAMILIES.contains(&face.family);
+-            assert!(!cfg!(target_arch = "wasm32") || !native_ui, "native UI face in web payload");
++            assert!(
++                !cfg!(target_arch = "wasm32") || !native_ui || CRAFT_FONTS_WEB_HANS,
++                "native UI face in the web payload without the CRAFT_FONTS_WEB_HANS opt-in"
++            );
+             let cap = if native_ui { MAX_NATIVE_UI_CJK_BYTES } else { MAX_OTHER_CJK_BYTES };
+             assert!(u64::try_from(len).is_ok_and(|n| n <= cap), "{} is embedded at {len} bytes", face.name());
+         }
+@@ -361,6 +372,7 @@ mod tests {
+         assert_eq!(ui.len(), CRAFT_FONTS.iter().filter(|f| f.covers("Jpan")).count());
+         let ui_zh = ui_chinese_fonts();
+         assert_eq!(ui_zh.len(), CRAFT_FONTS.iter().filter(|f| f.covers("Hans")).count());
++        assert_eq!(document_chinese_fonts().len(), ui_zh.len());
+         if CRAFT_FONTS.is_empty() {
+             eprintln!("built without craft-fonts (CRAFT_FONTS_DIR unset): no Japanese faces, as expected");
+             assert!(SHIPPORI_MINCHO.is_none() && ui.is_empty() && ui_zh.is_empty());
+diff --git a/crates/fonts/src/lib.rs b/crates/fonts/src/lib.rs
+index 45cb843a..4b918efc 100644
+--- a/crates/fonts/src/lib.rs
++++ b/crates/fonts/src/lib.rs
+@@ -21,9 +21,10 @@ pub mod source_shaping;
+ mod std14;
+ mod std14_metrics;
+ pub use craft::{
+-    CRAFT_FONTS, CraftFont, SHIPPORI_MINCHO, document_arabic_font, document_devanagari_font, document_hebrew_font, document_japanese_font,
+-    document_japanese_font_for_style, document_japanese_fonts_for_style, document_latin_fonts, document_thai_font, ui_arabic_fonts, ui_chinese_fonts,
+-    ui_cjk_fonts, ui_devanagari_fonts, ui_hebrew_fonts, ui_japanese_fonts, ui_telugu_fonts, ui_thai_fonts,
++    CRAFT_FONTS, CRAFT_FONTS_WEB_HANS, CraftFont, SHIPPORI_MINCHO, document_arabic_font, document_chinese_fonts, document_devanagari_font,
++    document_hebrew_font, document_japanese_font, document_japanese_font_for_style, document_japanese_fonts_for_style, document_latin_fonts,
++    document_thai_font, ui_arabic_fonts, ui_chinese_fonts, ui_cjk_fonts, ui_devanagari_fonts, ui_hebrew_fonts, ui_japanese_fonts, ui_telugu_fonts,
++    ui_thai_fonts,
+ };
+ pub use plan::{MAX_PLAN_GLYPHS, MAX_TYPE3_GLYPHS, PlannedType3, TextPlan};
+ pub use script::{

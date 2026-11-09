@@ -2,7 +2,7 @@
 
 What this repository adds to upstream's build beyond building it: installability and offline
 use. Upstream's `apps/pdfcraft-web` build is a folder of static files with no manifest, no
-icons and no service worker — a browser tab that redownloads its ~60 MB wasm once Pages'
+icons and no service worker — a browser tab that redownloads its ~73 MB wasm once Pages'
 ten-minute cache has gone stale (every build renames the files anyway), and that is all it
 is. The publishing workflow applies this layer on top, and the site becomes something that
 installs to the home screen, loads instantly on repeat visits, and works on a plane.
@@ -50,7 +50,7 @@ sender is injected into `index.html` by `apply.py`), the page asks the worker fo
 whose JSON names the icons — into Cache Storage, and only once **all** of them are in, let
 the new page replace the cached one and prune the previous build's hashed files. A partially
 fetched or broken deploy therefore never displaces a working build, and the cache stays one
-build (~60 MB) deep. Running after the page's own downloads means the warm-up's refetches
+build (~73 MB) deep. Running after the page's own downloads means the warm-up's refetches
 come from the browser's HTTP cache, not the network.
 
 At fetch time: navigations to the app page are served from the cache (offline use), with a

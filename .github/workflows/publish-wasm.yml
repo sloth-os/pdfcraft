@@ -7,7 +7,11 @@
 # wasm32-unknown-unknown target, Trunk 0.21.14, the craft-i18n checkout pinned by the app's
 # craft-i18n.rev, and (the release recipe's web-craft-fonts option) the craft-fonts checkout
 # pinned by PdfCraft's own release.yml, so the wasm embeds the fallback fonts and Edit text works
-# for Japanese, Arabic, Thai, Hebrew and Devanagari text. On top of the static site Trunk leaves
+# for Japanese, Arabic, Thai, Hebrew and Devanagari text. Before the build it applies this
+# repository's Simplified Chinese web-fallback patch (patches/) — upstream reads craft-fonts'
+# separate Chinese manifest in native builds only, and the patch adds the opt-in
+# (CRAFT_FONTS_WEB_HANS) that lets the wasm build embed that face too, so Edit text also works
+# for Simplified Chinese. On top of the static site Trunk leaves
 # in dist/web, the workflow applies this repository's PWA layer (pwa/) — the web app manifest,
 # upstream's own app icon in the sizes installers ask for, and a service worker that caches the
 # build for offline use; see pwa/README.md — before deploying. Every URL in the generated
@@ -93,14 +97,36 @@ jobs:
           persist-credentials: false
 
       # Upstream is checked out at the workspace root, so this repository's own files are not in
-      # the workspace yet. The PWA layer applied after the build — the manifest, the icons, the
-      # service worker and the scripts that add and test them — lives in pwa/ here; bring it in
-      # at publisher/.
+      # the workspace yet. Two things live here: the Simplified Chinese web-fallback patch
+      # (patches/), applied to the upstream checkout before the build, and the PWA layer applied
+      # after it — the manifest, the icons, the service worker and the scripts that add and test
+      # them (pwa/). Bring both in at publisher/.
       - name: Check out this repository's publishing layer
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: publisher
           persist-credentials: false
+
+      # This repository's one change to PdfCraft's source: patches/simplified-chinese-web-fallback
+      # .patch, generated against v0.19.0. Upstream reads craft-fonts' separate Simplified Chinese
+      # manifest — the LXGW WenKai Lite face Edit text falls back to for Simplified Chinese — in
+      # native builds only; the patch adds the CRAFT_FONTS_WEB_HANS opt-in that lets a wasm build
+      # embed that face too, plus the tests that keep the opt-in honest (patches/README.md has the
+      # whole story). The check first is the point: when a future release moves the patched lines,
+      # this step fails loudly instead of the build quietly shipping a site whose Simplified
+      # Chinese support vanished — the patch then needs regenerating against that release.
+      - name: Apply the Simplified Chinese web-fallback patch
+        env:
+          # Caller-influenced (workflow_dispatch), so through env, never interpolated.
+          PDFCRAFT_REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if ! git apply --check publisher/patches/simplified-chinese-web-fallback.patch; then
+            echo "::error::the Simplified Chinese web-fallback patch no longer applies to storytold/pdfcraft at $PDFCRAFT_REF; regenerate it against that release (patches/README.md)"
+            exit 1
+          fi
+          git apply publisher/patches/simplified-chinese-web-fallback.patch
+          git diff --stat
 
       # The wasm build embeds the fallback fonts of the optional craft-fonts input (without them,
       # Edit text refuses Japanese text — the error names CRAFT_FONTS_DIR). PdfCraft's own release
@@ -137,8 +163,9 @@ jobs:
       # The release recipe's web-craft-fonts option: check out the pinned craft-fonts, and the
       # build embeds its fonts. The build.rs of crates/fonts embeds the wasm subset on wasm32 —
       # the Japanese fallback face BIZ UDPGothic Regular and the small Arabic/Thai/Hebrew/
-      # Devanagari faces, about 6 MiB — and CRAFT_FONTS_REQUIRED=1 makes a bad checkout fatal
-      # instead of quietly shipping the degraded build again.
+      # Devanagari faces, about 6 MiB, plus (behind the patch's CRAFT_FONTS_WEB_HANS, below) the
+      # Simplified Chinese face LXGW WenKai Lite, about 13 MiB — and CRAFT_FONTS_REQUIRED=1 makes
+      # a bad checkout fatal instead of quietly shipping the degraded build again.
       - name: Check out craft-fonts
         uses: storytold/craft-common-actions/actions/checkout-craft-fonts@8e9b8b96c5d64c54eba462f5e8cac196787e744d # main, 2026-11-07
         with:
@@ -148,12 +175,26 @@ jobs:
       # CRAFT_I18N_REQUIRED=1, so the interface ships with its translations.
       - uses: storytold/craft-common-actions/actions/checkout-craft-i18n@8e9b8b96c5d64c54eba462f5e8cac196787e744d # main, 2026-11-07
 
+      # CRAFT_FONTS_WEB_HANS is the patch's opt-in: without it a wasm build skips craft-fonts'
+      # separate Simplified Chinese manifest even when CRAFT_FONTS_REQUIRED=1 (upstream keeps the
+      # face native-only for size), so the embedded fonts stay exactly the official web build's.
       - name: Build the wasm site
         working-directory: apps/pdfcraft-web
         env:
           CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
           CRAFT_FONTS_REQUIRED: "1"
+          CRAFT_FONTS_WEB_HANS: "1"
         run: trunk build --release
+
+      # The outcome guard of the patch above: the site is good only if the Chinese manifest's
+      # faces are actually in the artifact, whatever the mechanism did between the patch and
+      # the file — a lost env var, a manifest that changed shape, a size cap that now skips
+      # the face. wasm-opt splits the faces' data segments, so the script reassembles the
+      # module's linear memory and hashes each face there against the sha256 pinned in the
+      # manifest, a pin the build itself never checks. patches/verify-embedded-face.py
+      # documents the why; it exits nonzero — failing the deploy — when a face is missing.
+      - name: Verify the Simplified Chinese faces are embedded
+        run: python3 publisher/patches/verify-embedded-face.py dist/web craft-fonts
 
       # PdfCraft is MIT OR Apache-2.0; redistribution carries its notices. The embedded craft-fonts
       # faces are OFL-1.1, whose licence must ship with them. The release zip does both through
@@ -183,8 +224,9 @@ jobs:
               echo "dist/web/OFL-$family.txt"
             fi
           done
-          # Provenance: which upstream build the published site is.
-          printf 'Built from github.com/storytold/pdfcraft\nref:    %s\ncommit: %s\nfonts:  craft-fonts %s\n' \
+          # Provenance: which upstream build the published site is. The patch is this repository's
+          # one change to that source, so it is named too.
+          printf 'Built from github.com/storytold/pdfcraft\nref:    %s\ncommit: %s\nfonts:  craft-fonts %s\npatch:  simplified-chinese-web-fallback (CRAFT_FONTS_WEB_HANS)\n' \
             "$PDFCRAFT_REF" "$PDFCRAFT_COMMIT" "$FONTS_REF" > dist/web/BUILD.txt
           cat dist/web/BUILD.txt
 
@@ -245,6 +287,7 @@ jobs:
             echo "| PdfCraft ref | \`$ref_display\` |"
             echo "| Upstream commit | \`$COMMIT\` |"
             echo "| craft-fonts | \`$FONTS_REF\` |"
+            echo "| zh-Hans patch | simplified-chinese-web-fallback |"
             echo "| Version | $version |"
             echo "| Site | $PAGE_URL |"
           } >> "$GITHUB_STEP_SUMMARY"
