@@ -3,10 +3,10 @@
 //   node pwa/test-pwa.mjs [DIST]      (default: dist/web; needs python3 for the re-apply)
 //
 // The static half verifies what the build and apply.py put into DIST: the manifest (valid
-// JSON, its icons on disk and of the declared size), the links, theme colour and
-// service-worker registration injected into index.html, the OCR worker's file chain (a
-// <meta> in index.html names its loader; the chain must resolve to the worker's wasm) and
-// the OCR models staged under models/. The behavioural half runs sw.js in a mock
+// JSON, its icons on disk and of the declared size, its file handler), the links, theme
+// colour and service-worker registration injected into index.html, the OCR worker's file
+// chain (a <meta> in index.html names its loader; the chain must resolve to the worker's
+// wasm) and the OCR models staged under models/. The behavioural half runs sw.js in a mock
 // service-worker environment — node's own URL and Response, a fake Cache Storage, and a
 // fetch that serves DIST from disk or rejects to simulate being offline — and drives it
 // through activation, the warm-up message and fetch events: the warm-up caches the
@@ -14,7 +14,10 @@
 // incomplete new build changes nothing, the warm-up leaves the OCR models uncached,
 // navigations answer from the cache offline, build assets are served without touching
 // the network, named files (an OCR model among them) are fetched network-first, and
-// anything that is not this site's own GET is left to the browser.
+// anything that is not this site's own GET is left to the browser. It also runs the
+// injected launchQueue consumer in a mock page: the files the OS launches into the
+// installed app must wait for the canvas and the app's drop listener, then arrive as a
+// drop on the canvas — once — and a file that cannot be read must not lose the others.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -61,6 +64,28 @@ check(
   "the manifest is the expected app manifest",
 );
 check(manifest.theme_color === "#b70228", "the manifest's theme colour is the app colour");
+
+// OS file handling: the manifest's file_handlers register the installed app as an OS-level
+// PDF handler. The handler's action must be the app page itself — the consumer that takes
+// the launch lives only there — and in scope, like every other URL the layer adds.
+const handlers = manifest.file_handlers ?? [];
+check(Array.isArray(handlers) && handlers.length === 1, "the manifest registers the app as a file handler");
+for (const handler of handlers) {
+  const action = new URL(handler.action, SCOPE);
+  check(
+    action.href === SCOPE || action.href === SHELL,
+    `the file handler's action (${handler.action}) is the app page itself`,
+  );
+  const pdf = handler.accept?.["application/pdf"];
+  check(
+    Array.isArray(pdf) && pdf.includes(".pdf"),
+    "the file handler accepts application/pdf (.pdf)",
+  );
+}
+check(
+  manifest.launch_handler?.client_mode === "focus-existing",
+  "a launch focuses the running app rather than opening a second one",
+);
 
 // The manifest's icons must exist and be the size they declare — a wrong size is the
 // classic silent installability failure. PNG sizes sit in the IHDR chunk.
@@ -423,6 +448,122 @@ if (onnx.length > 0) {
     bypass.every(([, result]) => result.response === null),
     "cross-origin, non-GET and app-foreign files bypass the worker entirely",
   );
+}
+
+// --- the launchQueue consumer in a mock page ----------------------------------------
+//
+// File handling runs in the page, not the worker: the manifest's file_handlers name the
+// app an OS-level PDF handler, and apply.py injects a consumer that hands the launched
+// files to the app's own drop listener on the canvas. The hard part is timing — a file
+// launch starts the app, so the files are in hand before the canvas exists and long
+// before the wasm installs its listener — and the consumer's answer is the DOM's own
+// handshake: the app's listener cancels every drop it takes, so an uncancelled dispatch
+// means it isn't listening yet. The mock page steps the retries one at a time.
+{
+  const block = index.match(/<!-- pwa:begin[\s\S]*?pwa:end -->/)?.[0] ?? "";
+  const scripts = [...block.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+  const consumerScript = scripts.find((script) => script.includes("launchQueue.setConsumer"));
+  check(consumerScript !== undefined, "index.html injects the launchQueue consumer");
+
+  if (consumerScript) {
+    // A page before and after its load: no canvas while<head> parses, no drop listener
+    // until the wasm has started. dispatchEvent returns whether the event was cancelled —
+    // the app's listener cancels (preventDefault) every drop it takes.
+    const makePage = () => {
+      const dispatches = []; // every drop dispatched at the canvas
+      const drops = []; // the drops the app's listener took
+      const timeouts = []; // pending retries
+      const errors = []; // console.error calls
+      const canvas = {
+        dispatchEvent(event) {
+          dispatches.push(event);
+          if (listener) listener(event);
+          return !event.defaultPrevented;
+        },
+      };
+      let listener = null; // the app's drop listener; null until the wasm is up
+      let parsed = false; // the<body> with the canvas in it
+      const sandbox = {
+        window: {
+          launchQueue: {
+            consumer: null,
+            setConsumer(consumer) {
+              this.consumer = consumer;
+            },
+          },
+        },
+        document: { getElementById: (id) => (id === "pdfcraft" && parsed ? canvas : null) },
+        DataTransfer: class {
+          constructor() {
+            this.items = { list: [], add(file) { this.list.push(file); } };
+          }
+        },
+        DragEvent: class {
+          constructor(type, init = {}) {
+            this.type = type;
+            this.cancelable = init.cancelable ?? false;
+            this.dataTransfer = init.dataTransfer ?? null;
+            this.defaultPrevented = false;
+          }
+          preventDefault() {
+            this.defaultPrevented = true;
+          }
+        },
+        console: { error: (...args) => errors.push(args) },
+        setTimeout: (fn) => timeouts.push(fn),
+      };
+      sandbox.launchQueue = sandbox.window.launchQueue; // a bare global, as in the page
+      vm.runInNewContext(consumerScript, sandbox);
+      return {
+        sandbox,
+        dispatches,
+        drops,
+        timeouts,
+        errors,
+        parseBody: () => (parsed = true),
+        appUp: () => (listener = (event) => { event.preventDefault(); drops.push(event); }),
+        step: () => timeouts.shift()?.(),
+      };
+    };
+
+    // A cold-start launch: the consumer fires before the canvas exists, retries while the
+    // page parses and the wasm boots, and delivers once the app's listener is there. One
+    // of the launched files can't be read (moved or deleted since the launch).
+    {
+      const page = makePage();
+      const handles = [
+        { getFile: async () => ({ name: "launched.pdf" }) },
+        { getFile: async () => { throw new Error("the file is gone"); } },
+        { getFile: async () => ({ name: "second.pdf" }) },
+      ];
+      await page.sandbox.launchQueue.consumer({ files: handles });
+      check(page.dispatches.length === 0 && page.timeouts.length === 1,
+        "a launch while the page is still parsing waits for the canvas");
+      page.parseBody();
+      page.step();
+      page.step();
+      check(page.dispatches.length === 2 && page.drops.length === 0 && page.timeouts.length === 1,
+        "the consumer retries while the app's drop listener isn't installed");
+      page.appUp();
+      page.step();
+      check(page.drops.length === 1 && page.timeouts.length === 0,
+        "the launched files arrive as one drop, and delivery ends with it");
+      const drop = page.drops[0];
+      check(drop.type === "drop" && drop.cancelable === true, "the delivery is a cancelable drop event");
+      check(
+        drop.dataTransfer.items.list.map((file) => file.name).join(",") === "launched.pdf,second.pdf",
+        "the drop carries the readable launched files, in launch order",
+      );
+      check(page.errors.length === 1, "a launched file that can't be read is reported and skipped");
+
+      // A second launch, the app running: delivered at once, no retry.
+      await page.sandbox.launchQueue.consumer({ files: [{ getFile: async () => ({ name: "later.pdf" }) }] });
+      check(
+        page.drops.length === 2 && page.dispatches.length === 4 && page.timeouts.length === 0,
+        "a later launch, with the app already up, delivers at once",
+      );
+    }
+  }
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

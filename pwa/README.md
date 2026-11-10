@@ -1,25 +1,26 @@
 # The PWA layer
 
-What this repository adds to upstream's build beyond building it: installability and offline
-use. Upstream's `apps/pdfcraft-web` build is a folder of static files with no manifest, no
-icons and no service worker — a browser tab that redownloads its ~79 MB wasm once Pages'
-ten-minute cache has gone stale (every build renames the files anyway), and that is all it
-is. The publishing workflow applies this layer on top, and the site becomes something that
-installs to the home screen, loads instantly on repeat visits, and works on a plane.
+What this repository adds to upstream's build beyond building it: installability, offline
+use, and OS file handling. Upstream's `apps/pdfcraft-web` build is a folder of static files
+with no manifest, no icons and no service worker — a browser tab that redownloads its ~79 MB
+wasm once Pages' ten-minute cache has gone stale (every build renames the files anyway), and
+that is all it is. The publishing workflow applies this layer on top, and the site becomes
+something that installs to the home screen, loads instantly on repeat visits, works on a
+plane, and — once installed — opens PDFs from the OS's file manager in its own window.
 
 | file | |
 |---|---|
-| `manifest.webmanifest` | the web app manifest: name, icons, standalone display, the app colour |
+| `manifest.webmanifest` | the web app manifest: name, icons, standalone display, the app colour, and the registration as an OS PDF handler |
 | `sw.js` | the service worker — the offline cache; its header comment is the design document |
-| `apply.py` | copies the layer into a built `dist/` and injects links and registration into `index.html` |
-| `test-pwa.mjs` | checks the applied layer, then drives `sw.js` through a mock service-worker environment |
+| `apply.py` | copies the layer into a built `dist/` and injects links, the worker registration and the file-launch consumer into `index.html` |
+| `test-pwa.mjs` | checks the applied layer, then drives `sw.js` through a mock service-worker environment and the launch consumer through a mock page |
 | `icon-32.png` … `apple-touch-icon.png` | the icons, derived from upstream's own app icon (below) |
 
-The manifest's `id`, `start_url` and `scope` are all `"./"`, so it stays correct under the
-`/pdfcraft/` path Pages serves the site from — like every other URL the layer adds, they are
-relative. A layer file that is renamed or added must be updated in step everywhere it is
-named: `manifest.webmanifest`, `apply.py` (`FILES` and `BLOCK`), `sw.js` (`LAYER_FILE`) and
-`test-pwa.mjs`.
+The manifest's `id`, `start_url`, `scope` — and its file handler's `action` — are all `"./"`,
+so they stay correct under the `/pdfcraft/` path Pages serves the site from; like every other
+URL the layer adds, they are relative. A layer file that is renamed or added must be updated
+in step everywhere it is named: `manifest.webmanifest`, `apply.py` (`FILES` and `BLOCK`),
+`sw.js` (`LAYER_FILE`) and `test-pwa.mjs`.
 
 ## The icons
 
@@ -73,6 +74,52 @@ carry their content's hash; named files (the manifest, the icons, the OCR models
 network-first with the cached copy as the offline fallback. Everything else — licence files,
 `BUILD.txt`, a same-origin `?file=` document — bypasses the worker, so user documents never
 grow the cache. `sw.js` documents all of this in its header comment.
+
+## OS file handling
+
+Once the app is installed, the OS's file manager can offer it for PDFs: *Open with* → PdfCraft,
+a double-click after it is made the default, a drag onto its taskbar icon. Two manifest fields
+declare that — `file_handlers` (the app is a handler for `application/pdf`, `.pdf`) and
+`launch_handler: focus-existing` (a launch focuses the running instance instead of opening a
+second one, so unsaved work survives an *Open with*) — and Chromium-family browsers show the
+registration in `chrome://apps`. The handler's `action` is `"./"`, the app page itself: the
+manifest cannot name a script, only a URL, and this app's delivery has to live in the page
+anyway (below). A browser without `launchQueue` (Firefox, Safari) ignores both fields; the
+site works exactly as before.
+
+The delivery is the interesting half. When the OS launches the app with a file, the browser
+loads the handler's page and hands it the file through `window.launchQueue` — as a
+`FileSystemFileHandle`, not a URL and not bytes, so none of the app's existing entry points
+can take it: `?file=<url>` needs a same-origin URL for the bytes (a `blob:` URL names the
+document by its UUID instead of its file name), and the embedding host bridge
+(`?host=parent` / `data-host="page"`) routes the app's **saves** into messages the launching
+page would then have to answer itself — an installed app's saves must keep downloading. What
+the app does have is its own runtime open path: a PDF dropped on the window opens as a
+document tab, with the file's real name, through the drag-and-drop listener its UI installs
+on the canvas. So the injected consumer (`apply.py`'s second script) reads the launched files
+out of their handles and dispatches them to that listener as a synthetic, *cancelable*
+`drop` event on the canvas. The app cannot tell the difference: it opens the PDF, names the
+tab from the file, and reports its own errors — and a save still downloads.
+
+The timing needs the one trick in the code. A file launch cold-starts the app, so the
+consumer runs long before anything can take the files — before the `<body>` has even parsed
+(the script sits in `<head>`, and the canvas comes with the body), and then for as long as
+the wasm takes to fetch, compile and install its listeners (a fresh launch can be offline,
+where the service worker serves the ~79 MB from cache, but it still takes a moment). The
+consumer therefore retries every 250 ms — and knows when to stop by the DOM's own handshake:
+the app's drop listener calls `preventDefault()` on every drop it takes, and
+`dispatchEvent()` returns `false` exactly when someone did. An uncancelled dispatch means
+nobody was listening yet; a cancelled one means the PDF was taken, and the retries end. A
+file whose handle can no longer be read (moved or deleted since the launch) is skipped with
+a console error, and a launch that delivers into a running instance whose *Combine files*
+tab is focused joins that list — the same thing a drag does there, which is the app's own
+consistent contract for files it receives at runtime.
+
+`test-pwa.mjs` runs the injected consumer in a mock page and steps those retries by hand: a
+launch before the canvas exists waits for it; the consumer keeps retrying while the app's
+listener is absent; the files arrive as one cancelable drop carrying the readable files in
+launch order, and delivery ends with it; a later launch into the running app delivers at
+once.
 
 ## Applying and testing locally
 

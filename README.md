@@ -25,8 +25,10 @@ This repository holds no PdfCraft source. It contains one workflow,
    the sha256 pinned in upstream's ATTRIBUTION.toml and ships with its CC-BY-SA-4.0 licence
    text and attribution);
 5. applies this repository's PWA layer ([`pwa/`](pwa/README.md)) to the build: the web app
-   manifest, the app icons (upstream's own), the theme colour, and a service worker that caches
-   the build for offline use — then runs the layer's test harness over the finished site;
+   manifest, the app icons (upstream's own), the theme colour, a service worker that caches
+   the build for offline use, and — once the app is installed — registration as an OS-level
+   PDF handler, so a PDF opened from the file manager comes up in the app — then runs the
+   layer's test harness over the finished site;
 6. deploys the static site to GitHub Pages.
 
 It runs on every push to `main`, once a day (03:17 UTC), and manually from the Actions tab
@@ -42,7 +44,7 @@ CC-BY-SA-4.0; the site ships each set's licence files (the models' attribution i
 `models/ATTRIBUTION.txt`), and `BUILD.txt` names the upstream commit and craft-fonts pin it
 was built from.
 
-## PWA: install and offline
+## PWA: install, offline, and opening PDFs from the OS
 
 The site is installable (Chrome/Edge's install icon, iOS's *Add to Home Screen*, Android's
 web-app install banner) and works offline: open it once while online, wait a moment for the app
@@ -55,5 +57,10 @@ the working one. Repeat visits are served from the cache, so the ~79 MB wasm dow
 build instead of once per stale cache. Scan & OCR works offline too: the OCR worker's files are
 warmed up with the build, and the models are cached as the page downloads them on first use.
 Everything the layer does is documented in [`pwa/README.md`](pwa/README.md) and `pwa/sw.js`.
+
+Once installed (Chromium-family browsers), the app registers with the OS as a PDF handler:
+*Open with* → PdfCraft, or a double-click after making it the default, opens the file in the
+app's own window — no browser UI — with the document in a tab named after the file, exactly as
+if it had been dragged onto the window. Saving keeps downloading, as in the browser.
 
 [hosting]: https://github.com/storytold/pdfcraft/blob/main/packaging/web/README.md

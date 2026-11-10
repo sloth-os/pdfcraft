@@ -246,17 +246,22 @@ jobs:
             "$PDFCRAFT_REF" "$PDFCRAFT_COMMIT" "$FONTS_REF" > dist/web/BUILD.txt
           cat dist/web/BUILD.txt
 
-      # This repository's PWA layer, on top of upstream's build: the web app manifest, the icons
-      # (upstream's own app icon; its licence ships above), the theme colour and the registration
-      # of the offline-caching service worker. apply.py copies the layer into dist/web and
-      # injects the links into index.html; pwa/README.md explains the design.
+      # This repository's PWA layer, on top of upstream's build: the web app manifest (with the
+      # file_handlers that register the installed app as an OS-level PDF handler), the icons
+      # (upstream's own app icon; its licence ships above), the theme colour, the registration
+      # of the offline-caching service worker, and the launchQueue consumer that delivers a
+      # PDF opened from the OS to the app. apply.py copies the layer into dist/web and injects
+      # the links and scripts into index.html; pwa/README.md explains the design.
       - name: Add the PWA layer
         run: python3 publisher/pwa/apply.py dist/web
 
       # The layer's harness: static checks on the applied site (the injected links, the icons,
-      # the OCR worker's file chain, the staged models), then sw.js driven through a mock
-      # service-worker environment — warm-up caching, the all-or-nothing build swap, offline
-      # navigation, the models' network-first serving, and the files that must bypass the worker.
+      # the manifest's file handler, the OCR worker's file chain, the staged models), then sw.js
+      # driven through a mock service-worker environment — warm-up caching, the all-or-nothing
+      # build swap, offline navigation, the models' network-first serving, and the files that
+      # must bypass the worker — and the launchQueue consumer driven through a mock page: a
+      # launch before the canvas exists waits and retries until the app's drop listener is up,
+      # then delivers the files as one drop.
       - name: Test the PWA layer
         run: node publisher/pwa/test-pwa.mjs dist/web
 

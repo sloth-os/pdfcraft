@@ -5,6 +5,10 @@
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
+  "launch_handler": { "client_mode": "focus-existing" },
+  "file_handlers": [
+    { "action": "./", "accept": { "application/pdf": [".pdf"] } }
+  ],
   "lang": "en",
   "dir": "ltr",
   "background_color": "#f1f1f3",

@@ -6,7 +6,9 @@ Usage: apply.py [DIST]  (default: dist/web)
 Upstream's build of apps/pdfcraft-web leaves a static site whose index.html carries only the
 wasm bootstrap. This script copies pwa/ into DIST — the web app manifest, the app icons and
 the offline-caching service worker (sw.js explains that) — and injects into index.html the
-manifest link, the icons, the browser theme colour and the worker registration. The icons are
+manifest link, the icons, the browser theme colour, the worker registration, and the
+launchQueue consumer that hands a PDF opened from the OS over to the app (the manifest's
+file_handlers names it a PDF handler; the consumer below explains the delivery). The icons are
 upstream's own app icon, licensed like the rest of PdfCraft (MIT OR Apache-2.0); the licence
 files the workflow already ships with the site cover them.
 
@@ -24,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 
 # What pwa/ adds to the site beyond upstream's build.
 FILES = [
-    "manifest.webmanifest",   # installability: name, icons, colours
+    "manifest.webmanifest",   # installability: name, icons, colours, OS file handling
     "sw.js",                  # the offline cache
     "icon-32.png",            # favicon
     "icon-192.png",           # manifest icon
@@ -37,12 +39,15 @@ FILES = [
 GUARD = re.compile(r'(?:src|href)="/[^/]')
 
 # Injected at the end of <head>. Every URL relative — the site is served under /pdfcraft/.
-# The script registers sw.js at once (its fetch handling starts with it), and asks it for a
-# warm-up — cache this build for offline use — when Trunk's bootstrap announces that the
-# wasm has been fetched and started.
+# The first script registers sw.js at once (its fetch handling starts with it), and asks it
+# for a warm-up — cache this build for offline use — when Trunk's bootstrap announces that
+# the wasm has been fetched and started. The second is the launchQueue consumer that hands
+# PDFs the OS opens with the installed app to the app (the manifest's file_handlers names it
+# a handler; pwa/README.md explains the delivery).
 BLOCK = """
-    <!-- pwa:begin — this repository's PWA layer: installability, icons, theme colour and the
-         offline-caching service worker; see pwa/ in the publishing repository. -->
+    <!-- pwa:begin — this repository's PWA layer: installability, icons, theme colour, the
+         offline-caching service worker and the OS-file-handling consumer; see pwa/ in the
+         publishing repository. -->
     <meta name="description" content="The PDF workbench; an open-source, modern PDF reader and editor, built in pure Rust." />
     <meta name="theme-color" content="#b70228" />
     <link rel="manifest" href="manifest.webmanifest" />
@@ -55,6 +60,43 @@ BLOCK = """
           navigator.serviceWorker.ready
             .then((registration) => registration.active && registration.active.postMessage("warm-up"));
         }, { once: true });
+      }
+    </script>
+    <script>
+      // OS file handling (the manifest's file_handlers register the installed app as a PDF
+      // handler): the OS's launched files arrive through launchQueue, and the app has no
+      // launch API of its own — but it opens a dropped file as a document, with the file's
+      // real name and its own error reporting, through the drag-and-drop listener its UI
+      // installs on the canvas. Deliver the launch through that: a synthetic, cancelable
+      // drop carrying the files.
+      if ("launchQueue" in window) {
+        launchQueue.setConsumer(async (params) => {
+          if (!params.files?.length) return;
+          const files = [];
+          for (const handle of params.files) {
+            try {
+              files.push(await handle.getFile());
+            } catch (error) {
+              console.error("PdfCraft: couldn't read a launched file", error);
+            }
+          }
+          if (!files.length) return;
+          // The listener arrives with the wasm: a file launch starts the app, so the files
+          // are in hand long before the canvas can take them (if the page has a canvas at
+          // all yet; this runs while its <head> is still parsing). dispatchEvent reports
+          // whether a listener cancelled the event, and the app's listener cancels every
+          // drop it sees — so an uncancelled dispatch means it isn't there yet. Retry until
+          // one is, and no further.
+          const deliver = () => {
+            const canvas = document.getElementById("pdfcraft");
+            if (!canvas) return false;
+            const data = new DataTransfer(); // fresh each attempt; it can't be reused
+            for (const file of files) data.items.add(file);
+            return !canvas.dispatchEvent(new DragEvent("drop", { cancelable: true, dataTransfer: data }));
+          };
+          const attempt = () => { if (!deliver()) setTimeout(attempt, 250); };
+          attempt();
+        });
       }
     </script>
     <!-- pwa:end -->
@@ -88,6 +130,7 @@ def main() -> int:
         '<meta name="theme-color" content="#b70228"',
         'navigator.serviceWorker.register("./sw.js")',
         "TrunkApplicationStarted",
+        'launchQueue.setConsumer',
     ]
     missing = [needle for needle in expected if needle not in html]
     if missing:
@@ -97,7 +140,7 @@ def main() -> int:
     for icon in manifest["icons"]:
         if not (dist / icon["src"]).is_file():
             sys.exit(f"the manifest names {icon['src']}, but it is not in {dist}")
-    print(f"{html_path}: manifest, icons, theme colour and worker registration injected")
+    print(f"{html_path}: manifest, icons, theme colour, worker registration and the file-launch consumer injected")
     return 0
 
 
